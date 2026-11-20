@@ -1,0 +1,16 @@
+User-agent: *
+Allow: /
+Allow: /app
+Allow: /install
+Allow: /refer-earn
+Disallow: /api/
+Disallow: /admin
+Disallow: /admin-login
+Disallow: /admin-panel
+Disallow: /admin-dashboard
+Disallow: /manage-admins
+Disallow: /room-manager
+Disallow: /ban-management
+Disallow: /winner-payout-list
+
+Sitemap: https://ais-pre-xqluoj7ufqf3547m4ybkp7-104523512966.asia-northeast1.run.app/sitemap.xml

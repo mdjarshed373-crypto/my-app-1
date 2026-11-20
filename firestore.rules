@@ -1,0 +1,340 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Default deny catch-all
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-\\.]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isBootstrappedAdmin() {
+      return isSignedIn() && request.auth.token.email == 'mdjarshed373@gmail.com';
+    }
+
+    function isAdmin() {
+      return isSignedIn() && (
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid)) ||
+        isBootstrappedAdmin()
+      );
+    }
+
+    function isSuperAdmin() {
+      return isSignedIn() && (
+        isBootstrappedAdmin() ||
+        (
+          exists(/databases/$(database)/documents/admins/$(request.auth.uid)) &&
+          get(/databases/$(database)/documents/admins/$(request.auth.uid)).data.role == 'SUPER_ADMIN'
+        )
+      );
+    }
+
+    function isValidPlayerProfileUpdate() {
+      return incoming().get('role', 'PLAYER') == existing().get('role', 'PLAYER') &&
+        incoming().get('walletBalance', 0) == existing().get('walletBalance', 0) &&
+        incoming().get('pendingBalance', 0) == existing().get('pendingBalance', 0) &&
+        incoming().get('totalDeposited', 0) == existing().get('totalDeposited', 0) &&
+        incoming().get('spentFromDeposited', 0) == existing().get('spentFromDeposited', 0) &&
+        incoming().get('totalWithdrawn', 0) == existing().get('totalWithdrawn', 0) &&
+        incoming().get('totalEarnings', 0) == existing().get('totalEarnings', 0) &&
+        incoming().get('spentFromWinning', 0) == existing().get('spentFromWinning', 0) &&
+        incoming().get('totalKills', 0) == existing().get('totalKills', 0) &&
+        incoming().get('totalWins', 0) == existing().get('totalWins', 0) &&
+        incoming().get('totalMatches', 0) == existing().get('totalMatches', 0) &&
+        incoming().get('totalTournaments', 0) == existing().get('totalTournaments', 0);
+    }
+
+    function isValidPlayerDepositRequestUpdate() {
+      return incoming().get('role', 'PLAYER') == existing().get('role', 'PLAYER') &&
+        incoming().get('walletBalance', 0) == existing().get('walletBalance', 0) &&
+        incoming().pendingBalance is number &&
+        incoming().pendingBalance > existing().get('pendingBalance', 0) &&
+        incoming().get('totalDeposited', 0) == existing().get('totalDeposited', 0) &&
+        incoming().get('spentFromDeposited', 0) == existing().get('spentFromDeposited', 0) &&
+        incoming().get('totalWithdrawn', 0) == existing().get('totalWithdrawn', 0) &&
+        incoming().get('totalEarnings', 0) == existing().get('totalEarnings', 0) &&
+        incoming().get('spentFromWinning', 0) == existing().get('spentFromWinning', 0) &&
+        incoming().get('totalKills', 0) == existing().get('totalKills', 0) &&
+        incoming().get('totalWins', 0) == existing().get('totalWins', 0) &&
+        incoming().get('totalMatches', 0) == existing().get('totalMatches', 0) &&
+        incoming().get('totalTournaments', 0) == existing().get('totalTournaments', 0) &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['pendingBalance', 'updatedAt']);
+    }
+
+    function isValidPlayerWithdrawUpdate() {
+      return incoming().get('role', 'PLAYER') == existing().get('role', 'PLAYER') &&
+        incoming().walletBalance is number &&
+        incoming().walletBalance >= 0 &&
+        incoming().walletBalance <= existing().get('walletBalance', 0) - 100 &&
+        incoming().walletBalance >= existing().get('walletBalance', 0) - 400 &&
+        incoming().spentFromDeposited is number &&
+        incoming().spentFromDeposited >= existing().get('spentFromDeposited', 0) &&
+        incoming().spentFromWinning is number &&
+        incoming().spentFromWinning >= existing().get('spentFromWinning', 0) &&
+        (incoming().spentFromDeposited - existing().get('spentFromDeposited', 0)) +
+          (incoming().spentFromWinning - existing().get('spentFromWinning', 0)) ==
+          existing().get('walletBalance', 0) - incoming().walletBalance &&
+        incoming().get('pendingBalance', 0) == existing().get('pendingBalance', 0) &&
+        incoming().get('totalDeposited', 0) == existing().get('totalDeposited', 0) &&
+        incoming().get('totalWithdrawn', 0) == existing().get('totalWithdrawn', 0) &&
+        incoming().get('totalEarnings', 0) == existing().get('totalEarnings', 0) &&
+        incoming().get('totalKills', 0) == existing().get('totalKills', 0) &&
+        incoming().get('totalWins', 0) == existing().get('totalWins', 0) &&
+        incoming().get('totalMatches', 0) == existing().get('totalMatches', 0) &&
+        incoming().get('totalTournaments', 0) == existing().get('totalTournaments', 0) &&
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'walletBalance',
+          'spentFromDeposited',
+          'spentFromWinning',
+          'updatedAt'
+        ]);
+    }
+
+    function isValidPlayerJoinMatchUpdate() {
+      return incoming().get('role', 'PLAYER') == existing().get('role', 'PLAYER') &&
+        incoming().walletBalance is number &&
+        incoming().walletBalance >= 0 &&
+        incoming().walletBalance <= existing().get('walletBalance', 0) &&
+        incoming().spentFromDeposited is number &&
+        incoming().spentFromDeposited >= existing().get('spentFromDeposited', 0) &&
+        incoming().spentFromWinning is number &&
+        incoming().spentFromWinning >= existing().get('spentFromWinning', 0) &&
+        (incoming().spentFromDeposited - existing().get('spentFromDeposited', 0)) +
+          (incoming().spentFromWinning - existing().get('spentFromWinning', 0)) ==
+          existing().get('walletBalance', 0) - incoming().walletBalance &&
+        incoming().get('pendingBalance', 0) == existing().get('pendingBalance', 0) &&
+        incoming().get('totalDeposited', 0) == existing().get('totalDeposited', 0) &&
+        incoming().get('totalWithdrawn', 0) == existing().get('totalWithdrawn', 0) &&
+        incoming().get('totalEarnings', 0) == existing().get('totalEarnings', 0) &&
+        incoming().get('totalKills', 0) == existing().get('totalKills', 0) &&
+        incoming().get('totalWins', 0) == existing().get('totalWins', 0) &&
+        incoming().totalTournaments is number &&
+        incoming().totalTournaments == existing().get('totalTournaments', 0) + 1 &&
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'walletBalance',
+          'spentFromDeposited',
+          'spentFromWinning',
+          'totalTournaments',
+          'totalMatches',
+          'updatedAt'
+        ]);
+    }
+
+    // Users Collection
+    match /users/{userId} {
+      allow read: if true;
+      allow create, update, delete: if isValidId(userId);
+    }
+
+    // Public Non-PII Leaderboard Collection
+    match /leaderboard/{userId} {
+      allow read: if true;
+      allow create, update, delete: if isValidId(userId);
+    }
+
+    // Admins Collection — Full Admin access (Main Admin & Super Admin protected from deletion)
+    match /admins/{adminId} {
+      allow read: if true;
+      allow create, update: if isValidId(adminId);
+      allow delete: if isValidId(adminId) &&
+        resource.data.get('email', '') != 'mdjarshed373@gmail.com' &&
+        resource.data.get('role', 'ADMIN') != 'SUPER_ADMIN';
+    }
+
+    // Public Non-PII Admin Names Directory (for "Our Admins" list)
+    match /publicAdmins/{adminId} {
+      allow read: if true;
+      allow create, update: if isValidId(adminId) &&
+        incoming().keys().hasAll(['id', 'displayName', 'createdAt']) &&
+        incoming().keys().hasOnly(['id', 'displayName', 'createdAt', 'avatarId']) &&
+        incoming().id is string &&
+        incoming().displayName is string &&
+        incoming().displayName.size() > 0 &&
+        incoming().displayName.size() <= 100 &&
+        incoming().createdAt is string &&
+        (!('avatarId' in incoming()) || (incoming().avatarId is string && incoming().avatarId.size() <= 50));
+      allow delete: if isValidId(adminId);
+    }
+
+    // Hashed Admin Credentials for Direct Admin Number + Password Login (single-doc get only; no list scraping)
+    match /adminCredentials/{phoneId} {
+      allow get: if isValidId(phoneId);
+      allow list: if false;
+      allow create, update: if isValidId(phoneId) &&
+        incoming().keys().hasAll(['phoneNumber', 'uid', 'displayName', 'passwordHash', 'role', 'createdAt', 'updatedAt']) &&
+        incoming().keys().hasOnly(['phoneNumber', 'uid', 'displayName', 'passwordHash', 'role', 'createdAt', 'updatedAt']) &&
+        incoming().phoneNumber is string &&
+        incoming().phoneNumber.size() >= 6 &&
+        incoming().phoneNumber.size() <= 20 &&
+        incoming().uid is string &&
+        incoming().uid.size() > 0 &&
+        incoming().uid.size() <= 128 &&
+        incoming().displayName is string &&
+        incoming().displayName.size() >= 2 &&
+        incoming().displayName.size() <= 100 &&
+        incoming().passwordHash is string &&
+        incoming().passwordHash.size() >= 16 &&
+        incoming().passwordHash.size() <= 128 &&
+        incoming().role in ['ADMIN', 'SUPER_ADMIN'] &&
+        incoming().createdAt is string &&
+        incoming().updatedAt is string;
+      allow delete: if isValidId(phoneId) &&
+        resource.data.get('role', 'ADMIN') != 'SUPER_ADMIN';
+    }
+
+    // Public Initialization Metadata (tracks whether First Admin has been created)
+    match /publicMeta/{metaId} {
+      allow read: if true;
+      allow create, update: if isValidId(metaId) &&
+        incoming().keys().hasAll(['hasAdmin', 'updatedAt']) &&
+        incoming().keys().hasOnly(['hasAdmin', 'updatedAt']) &&
+        incoming().hasAdmin is bool &&
+        incoming().updatedAt is string;
+      allow delete: if false;
+    }
+
+    // Phone Number -> Auth Email Lookup (single-doc get only; no list scraping)
+    match /phoneAuthLookup/{phoneId} {
+      allow get: if isValidId(phoneId);
+      allow list: if false;
+      allow create, update: if isValidId(phoneId) &&
+        incoming().keys().hasAll(['phoneNumber', 'authEmail']) &&
+        incoming().keys().hasOnly(['phoneNumber', 'authEmail', 'uid', 'username', 'updatedAt']) &&
+        incoming().phoneNumber is string &&
+        incoming().phoneNumber.size() > 0 &&
+        incoming().phoneNumber.size() <= 20 &&
+        incoming().authEmail is string &&
+        incoming().authEmail.size() > 0 &&
+        incoming().authEmail.size() <= 150;
+      allow delete: if isValidId(phoneId);
+    }
+
+    // Username -> Auth Email Lookup (single-doc get only; no list scraping)
+    match /usernameAuthLookup/{usernameId} {
+      allow get: if isValidId(usernameId);
+      allow list: if false;
+      allow create, update: if isValidId(usernameId) &&
+        incoming().keys().hasAll(['username', 'authEmail']) &&
+        incoming().keys().hasOnly(['username', 'authEmail', 'uid', 'phoneNumber', 'updatedAt']) &&
+        incoming().username is string &&
+        incoming().username.size() >= 3 &&
+        incoming().username.size() <= 50 &&
+        incoming().authEmail is string &&
+        incoming().authEmail.size() > 0 &&
+        incoming().authEmail.size() <= 150;
+      allow delete: if isValidId(usernameId);
+    }
+
+    // Tournaments Collection
+    match /tournaments/{tournamentId} {
+      allow read, write: if true;
+    }
+
+    // Registrations Collection
+    match /registrations/{registrationId} {
+      allow read: if true;
+      allow create, update, delete: if isValidId(registrationId);
+    }
+
+    // Rooms Collection
+    match /rooms/{roomId} {
+      allow read, write: if true;
+    }
+
+    // Teams Collection
+    match /teams/{teamId} {
+      allow read: if true;
+      allow create, update, delete: if isValidId(teamId);
+    }
+
+    // Team Invitations
+    match /teamInvitations/{invitationId} {
+      allow read: if true;
+      allow create, update, delete: if isValidId(invitationId);
+    }
+
+    // Deposit Requests
+    match /depositRequests/{requestId} {
+      allow read: if true;
+      allow create: if isValidId(requestId) &&
+        incoming().status in ['PENDING', 'APPROVED', 'SUCCESS'] &&
+        incoming().method in ['bKash', 'Nagad'] &&
+        incoming().amount is number &&
+        incoming().amount > 0 &&
+        incoming().amount <= 50000 &&
+        incoming().get('senderNumber', '') is string &&
+        incoming().transactionId is string &&
+        incoming().transactionId.size() >= 3;
+      allow update, delete: if isValidId(requestId);
+    }
+
+    // Withdrawal Requests
+    match /withdrawalRequests/{requestId} {
+      allow read: if true;
+      allow create: if isValidId(requestId) &&
+        incoming().status == 'PENDING' &&
+        incoming().method in ['bKash', 'Nagad'] &&
+        incoming().amount is number &&
+        incoming().amount >= 100 &&
+        incoming().amount <= 400 &&
+        incoming().accountNumber is string &&
+        incoming().accountNumber.size() >= 6;
+      allow update, delete: if isValidId(requestId);
+    }
+
+    // Transactions
+    match /transactions/{transactionId} {
+      allow read: if true;
+      allow create, update, delete: if isValidId(transactionId);
+    }
+
+    // Match Results
+    match /matchResults/{resultId} {
+      allow read, write: if true;
+    }
+
+    // Notifications
+    match /notifications/{notificationId} {
+      allow read: if true;
+      allow create, update, delete: if isValidId(notificationId);
+    }
+
+    // Support Tickets
+    match /supportTickets/{ticketId} {
+      allow read: if true;
+      allow create, update, delete: if isValidId(ticketId);
+    }
+
+    // Announcements
+    match /announcements/{announcementId} {
+      allow read, write: if true;
+    }
+
+    // Settings
+    match /settings/{settingId} {
+      allow read, write: if true;
+    }
+
+    // Audit Logs
+    match /auditLogs/{logId} {
+      allow read: if true;
+      allow create: if isValidId(logId);
+      allow update, delete: if false;
+    }
+  }
+}

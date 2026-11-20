@@ -1,0 +1,6 @@
+{
+  "name": "TX TOUR BD - Free Fire Esports Tournament Platform",
+  "description": "Bangladesh's premier competitive Free Fire esports tournament platform with real-time room credentials, automated scoring, team management, and secure wallet.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
