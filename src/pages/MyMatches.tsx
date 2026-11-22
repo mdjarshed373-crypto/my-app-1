@@ -22,7 +22,7 @@ import {
 } from '../services/optimisticJoinStore';
 import { fetchMatchResult } from '../services/matchResultService';
 import { fetchUserTransactions } from '../services/walletService';
-import { formatEntryTypeLabel } from '../constants/categoryRules';
+import { formatEntryTypeLabel, parseMatchDateAndTime } from '../constants/categoryRules';
 import {
   BrowserNotificationPermissionState,
   ensureWebPushSubscribed,
@@ -202,9 +202,17 @@ export const MyMatches: React.FC<MyMatchesProps> = ({ onNavigate }) => {
 
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [copiedPass, setCopiedPass] = useState<string | null>(null);
+  const [nowMs, setNowMs] = useState<number>(() => Date.now());
   const [notifPermission, setNotifPermission] = useState<BrowserNotificationPermissionState>(() =>
     getNotificationPermissionState()
   );
+
+  useEffect(() => {
+    const timer = setInterval(() => {
+      setNowMs(Date.now());
+    }, 5000);
+    return () => clearInterval(timer);
+  }, []);
 
   useEffect(() => {
     return subscribeOptimisticJoins(currentUser?.uid, setOptimisticJoins);
@@ -311,14 +319,24 @@ export const MyMatches: React.FC<MyMatchesProps> = ({ onNavigate }) => {
         let ongoingCnt = 0;
         let completedCnt = 0;
 
+        const checkTimeMs = Date.now();
         for (const reg of regs) {
           const tour = tMap[reg.tournamentId];
           const res = resMap[reg.tournamentId];
           const isCompleted =
             tour?.status === 'COMPLETED' ||
             Boolean(res?.isPrizeDistributed || res?.isVerified);
+          const matchStart = tour
+            ? parseMatchDateAndTime(tour.matchDate, tour.matchTime)
+            : null;
           if (isCompleted) {
             completedCnt++;
+          } else if (matchStart) {
+            if (matchStart.getTime() <= checkTimeMs) {
+              ongoingCnt++;
+            } else {
+              upcomingCnt++;
+            }
           } else if (tour?.status === 'ONGOING') {
             ongoingCnt++;
           } else {
@@ -378,6 +396,10 @@ export const MyMatches: React.FC<MyMatchesProps> = ({ onNavigate }) => {
       tour?.status === 'COMPLETED' ||
       Boolean(res?.isPrizeDistributed || res?.isVerified);
     if (isCompleted) return 'COMPLETED';
+    const matchStart = tour ? parseMatchDateAndTime(tour.matchDate, tour.matchTime) : null;
+    if (matchStart) {
+      return matchStart.getTime() <= nowMs ? 'ONGOING' : 'UPCOMING';
+    }
     if (tour?.status === 'ONGOING') return 'ONGOING';
     return 'UPCOMING';
   };

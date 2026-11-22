@@ -3,13 +3,14 @@ import { createPortal } from 'react-dom';
 import { Tournament } from '../../types';
 import {
   addMinutesToSchedule,
-  applyTimeInputToSchedule,
-  format24HourToInputValue,
   formatMatchTimeOnly,
-  parseTimeTo24Hour,
+  getDhakaTodayDateStr,
+  getMatchTypeBadgeLabel,
+  getTournamentCategory,
+  parseMatchDateAndTime,
 } from '../../constants/categoryRules';
 import { updateMatchTimeWithNotification } from '../../services/tournamentService';
-import { Clock, X, Timer, Check, AlertCircle } from 'lucide-react';
+import { Clock, X, Minus, Plus, Check, AlertCircle } from 'lucide-react';
 
 interface EditMatchTimeModalProps {
   isOpen: boolean;
@@ -18,7 +19,8 @@ interface EditMatchTimeModalProps {
   onSuccess?: (updatedTournament: Tournament, message: string) => void;
 }
 
-const QUICK_DELAY_OPTIONS = [5, 10, 15] as const;
+const MAX_TIME_INCREASE_MINUTES = 15;
+const QUICK_PRESET_OFFSETS = [5, 10, 15] as const;
 
 export const EditMatchTimeModal: React.FC<EditMatchTimeModalProps> = ({
   isOpen,
@@ -26,78 +28,115 @@ export const EditMatchTimeModal: React.FC<EditMatchTimeModalProps> = ({
   onClose,
   onSuccess,
 }) => {
-  const [timeInput, setTimeInput] = useState<string>('20:00');
+  const [offsetMinutes, setOffsetMinutes] = useState<number>(0);
   const [saving, setSaving] = useState<boolean>(false);
-  const [activeDelay, setActiveDelay] = useState<number | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+
+  const todayDhakaStr = getDhakaTodayDateStr();
+  const anchorTimeStr = tournament
+    ? (tournament.originalMatchTime || tournament.matchTime || '').trim()
+    : '';
+  const rawAnchorDateStr = tournament
+    ? (tournament.originalMatchDate || tournament.matchDate || todayDhakaStr).trim()
+    : '';
+
+  const effectiveAnchorDateStr = (() => {
+    if (!tournament) return '';
+    const rawAnchorObj = parseMatchDateAndTime(rawAnchorDateStr, anchorTimeStr);
+    const nowMs = Date.now();
+    if (rawAnchorObj && rawAnchorObj.getTime() + MAX_TIME_INCREASE_MINUTES * 60000 <= nowMs) {
+      const todayAnchorObj = parseMatchDateAndTime(todayDhakaStr, anchorTimeStr);
+      if (
+        todayAnchorObj &&
+        todayAnchorObj.getTime() + MAX_TIME_INCREASE_MINUTES * 60000 > nowMs
+      ) {
+        return todayDhakaStr;
+      }
+    }
+    return rawAnchorDateStr;
+  })();
 
   useEffect(() => {
     if (!isOpen || !tournament) return;
-    const { hours, minutes } = parseTimeTo24Hour(tournament.matchTime);
-    setTimeInput(format24HourToInputValue(hours, minutes));
+
+    const anchorObj = parseMatchDateAndTime(effectiveAnchorDateStr, anchorTimeStr);
+    const currentObj = parseMatchDateAndTime(tournament.matchDate, tournament.matchTime);
+    let initialOffset = 0;
+
+    if (anchorObj && currentObj) {
+      let diff = Math.round((currentObj.getTime() - anchorObj.getTime()) / 60000);
+      if ((diff < 0 || diff > 60) && tournament.matchDate) {
+        const sameDayAnchor = parseMatchDateAndTime(tournament.matchDate, anchorTimeStr);
+        if (sameDayAnchor) {
+          diff = Math.round((currentObj.getTime() - sameDayAnchor.getTime()) / 60000);
+        }
+      }
+      initialOffset = Math.max(0, Math.min(MAX_TIME_INCREASE_MINUTES, diff));
+    }
+
+    setOffsetMinutes(initialOffset);
     setErrorMsg(null);
-    setActiveDelay(null);
     setSaving(false);
-  }, [isOpen, tournament?.id, tournament?.matchTime]);
+  }, [
+    isOpen,
+    tournament?.id,
+    tournament?.matchTime,
+    tournament?.matchDate,
+    effectiveAnchorDateStr,
+    anchorTimeStr,
+  ]);
 
   if (!isOpen || !tournament) return null;
 
+  const category = getTournamentCategory(tournament);
+  const matchTypeLabel = getMatchTypeBadgeLabel(category);
+  const anchorDisplayTime = formatMatchTimeOnly(anchorTimeStr || tournament.matchTime);
   const currentDisplayTime = formatMatchTimeOnly(tournament.matchTime);
-  const previewSchedule = applyTimeInputToSchedule(tournament.matchDate, timeInput);
 
-  const handleQuickDelay = async (deltaMinutes: number) => {
+  const previewSchedule = addMinutesToSchedule(
+    effectiveAnchorDateStr || tournament.matchDate,
+    anchorTimeStr || tournament.matchTime,
+    offsetMinutes
+  );
+  const maxSchedule = addMinutesToSchedule(
+    effectiveAnchorDateStr || tournament.matchDate,
+    anchorTimeStr || tournament.matchTime,
+    MAX_TIME_INCREASE_MINUTES
+  );
+
+  const handleStepMinus = () => {
     if (saving) return;
-    setErrorMsg(null);
-    setActiveDelay(deltaMinutes);
-    setSaving(true);
-    try {
-      const nextSchedule = addMinutesToSchedule(
-        tournament.matchDate,
-        tournament.matchTime,
-        deltaMinutes
-      );
-      setTimeInput(nextSchedule.timeInputValue);
-
-      const res = await updateMatchTimeWithNotification({
-        tournamentId: tournament.id,
-        newMatchTime: nextSchedule.matchTime,
-        newMatchDate: nextSchedule.matchDate,
-      });
-
-      if (!res.success || !res.updatedTournament) {
-        setErrorMsg(res.message);
-        return;
-      }
-
-      onSuccess?.(res.updatedTournament, res.message);
-      onClose();
-    } catch (err: unknown) {
-      setErrorMsg(
-        err instanceof Error ? err.message : 'ম্যাচের সময় আপডেট করতে সমস্যা হয়েছে।'
-      );
-    } finally {
-      setSaving(false);
-      setActiveDelay(null);
+    if (offsetMinutes <= 0) {
+      setErrorMsg(`মূল সময় (${anchorDisplayTime}) থেকে আর কমানো যাবে না।`);
+      return;
     }
+    setErrorMsg(null);
+    setOffsetMinutes((prev) => Math.max(0, prev - 1));
   };
 
-  const handleSaveCustomTime = async (e: React.FormEvent) => {
+  const handleStepPlus = () => {
+    if (saving) return;
+    if (offsetMinutes >= MAX_TIME_INCREASE_MINUTES) {
+      setErrorMsg(
+        `সর্বোচ্চ ১৫ মিনিট পর্যন্ত (${maxSchedule.matchTime}) Time বাড়ানো যাবে! এর বেশি নয়।`
+      );
+      return;
+    }
+    setErrorMsg(null);
+    setOffsetMinutes((prev) => Math.min(MAX_TIME_INCREASE_MINUTES, prev + 1));
+  };
+
+  const handleSaveTime = async (e: React.FormEvent) => {
     e.preventDefault();
     if (saving) return;
 
-    if (!timeInput || !/^\d{1,2}:\d{2}$/.test(timeInput.trim())) {
-      setErrorMsg('দয়া করে সঠিক সময় নির্বাচন করুন।');
-      return;
-    }
-
     setErrorMsg(null);
     setSaving(true);
     try {
-      const schedule = applyTimeInputToSchedule(tournament.matchDate, timeInput);
       const res = await updateMatchTimeWithNotification({
         tournamentId: tournament.id,
-        newMatchTime: schedule.matchTime,
-        newMatchDate: schedule.matchDate,
+        newMatchTime: previewSchedule.matchTime,
+        newMatchDate: previewSchedule.matchDate,
       });
 
       if (!res.success || !res.updatedTournament) {
@@ -121,9 +160,12 @@ export const EditMatchTimeModal: React.FC<EditMatchTimeModalProps> = ({
       onClick={() => {
         if (!saving) onClose();
       }}
-      className="fixed inset-0 z-[70] bg-black/75 backdrop-blur-sm flex items-center justify-center p-4"
+      className="fixed inset-0 z-[75] bg-black/75 backdrop-blur-sm flex items-center justify-center p-4"
     >
       <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="edit-time-modal-title"
         onClick={(e) => e.stopPropagation()}
         className="bg-white dark:bg-[#0D1428] border border-amber-400/70 dark:border-[#CFA84B]/50 rounded-2xl max-w-md w-full overflow-hidden shadow-2xl"
       >
@@ -134,9 +176,17 @@ export const EditMatchTimeModal: React.FC<EditMatchTimeModalProps> = ({
               <Clock className="w-4 h-4" />
             </div>
             <div className="min-w-0">
-              <h3 className="text-sm font-black font-gaming text-slate-900 dark:text-white uppercase tracking-wide truncate">
-                Edit Match Time
-              </h3>
+              <div className="flex items-center gap-2">
+                <h3
+                  id="edit-time-modal-title"
+                  className="text-sm font-black font-gaming text-slate-900 dark:text-white uppercase tracking-wide truncate"
+                >
+                  Edit Match Time
+                </h3>
+                <span className="px-1.5 py-0.5 rounded bg-red-600 text-white text-[9px] font-black font-gaming uppercase tracking-wider shrink-0">
+                  {matchTypeLabel}
+                </span>
+              </div>
               <p className="text-[11px] text-slate-600 dark:text-slate-400 truncate">
                 {tournament.title}
               </p>
@@ -154,87 +204,107 @@ export const EditMatchTimeModal: React.FC<EditMatchTimeModalProps> = ({
         </div>
 
         {/* Body */}
-        <form onSubmit={handleSaveCustomTime} className="p-5 space-y-5 bg-white dark:bg-[#0D1428]">
-          {/* Current Schedule Summary */}
-          <div className="p-3.5 rounded-xl bg-slate-50 dark:bg-[#070B18] border border-slate-200 dark:border-slate-800 flex items-center justify-between gap-3">
+        <form onSubmit={handleSaveTime} className="p-5 space-y-5 bg-white dark:bg-[#0D1428]">
+          {/* Schedule Summary */}
+          <div className="p-3.5 rounded-xl bg-slate-50 dark:bg-[#070B18] border border-slate-200 dark:border-slate-800 grid grid-cols-3 gap-2 text-center">
             <div>
               <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400 block">
-                Current Time
+                Original Time
               </span>
-              <span className="text-sm font-black font-gaming text-amber-700 dark:text-[#F4D77A] tabular-nums">
+              <span className="text-xs sm:text-sm font-black font-gaming text-slate-700 dark:text-slate-200 tabular-nums">
+                {anchorDisplayTime}
+              </span>
+            </div>
+            <div>
+              <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400 block">
+                Current Card
+              </span>
+              <span className="text-xs sm:text-sm font-black font-gaming text-amber-700 dark:text-[#F4D77A] tabular-nums">
                 {currentDisplayTime}
               </span>
             </div>
-            <div className="text-right">
+            <div>
               <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400 block">
-                Match Date
+                Max Limit
               </span>
-              <span className="text-xs font-bold font-mono text-slate-800 dark:text-slate-200 tabular-nums">
-                {tournament.matchDate || 'Today'}
+              <span className="text-xs sm:text-sm font-black font-gaming text-sky-600 dark:text-sky-400 tabular-nums">
+                {maxSchedule.matchTime}
               </span>
             </div>
           </div>
 
-          {/* 3 Quick Delay Buttons */}
-          <div className="space-y-2">
-            <label className="text-[11px] font-bold uppercase tracking-wider text-slate-600 dark:text-slate-300 flex items-center gap-1.5">
-              <Timer className="w-3.5 h-3.5 text-sky-600 dark:text-sky-400" />
-              <span>Quick Delay (১ ক্লিকে সময় বাড়ান)</span>
+          {/* 1-Minute +/- Stepper */}
+          <div className="space-y-3">
+            <label className="text-xs font-bold uppercase tracking-wider text-slate-700 dark:text-slate-200 block text-center">
+              Match Time (1 মিনিট করে বাড়ান বা কমান • সর্বোচ্চ +15 মিনিট)
             </label>
-            <div className="grid grid-cols-3 gap-2.5">
-              {QUICK_DELAY_OPTIONS.map((mins) => (
+
+            <div className="flex items-center justify-center gap-3">
+              <button
+                type="button"
+                onClick={handleStepMinus}
+                disabled={saving || offsetMinutes <= 0}
+                aria-label="Decrease Match Time by 1 minute"
+                className="w-14 h-14 rounded-2xl bg-slate-100 hover:bg-red-50 dark:bg-[#111D35] dark:hover:bg-red-950/60 border border-slate-300 dark:border-slate-700 hover:border-red-400 text-slate-900 dark:text-white hover:text-red-600 dark:hover:text-red-300 flex flex-col items-center justify-center transition-all cursor-pointer active:scale-95 disabled:opacity-40 disabled:cursor-not-allowed shrink-0"
+              >
+                <Minus className="w-5 h-5 stroke-[2.75]" />
+                <span className="text-[9px] font-black font-gaming leading-none mt-0.5">1M</span>
+              </button>
+
+              <div className="flex-1 max-w-[200px] h-14 px-3 rounded-2xl bg-slate-50 dark:bg-[#070B18] border-2 border-amber-400/70 dark:border-[#CFA84B]/60 flex flex-col items-center justify-center">
+                <span className="text-xl sm:text-2xl font-black font-gaming text-slate-900 dark:text-white tabular-nums leading-tight">
+                  {previewSchedule.matchTime}
+                </span>
+                <span className="text-[10px] font-bold font-gaming text-amber-700 dark:text-amber-300 leading-none">
+                  {offsetMinutes === 0 ? 'Original Time (+0m)' : `+${offsetMinutes} Min Delay`}
+                </span>
+              </div>
+
+              <button
+                type="button"
+                onClick={handleStepPlus}
+                disabled={saving || offsetMinutes >= MAX_TIME_INCREASE_MINUTES}
+                aria-label="Increase Match Time by 1 minute"
+                className="w-14 h-14 rounded-2xl bg-slate-100 hover:bg-emerald-50 dark:bg-[#111D35] dark:hover:bg-emerald-950/60 border border-slate-300 dark:border-slate-700 hover:border-emerald-400 text-slate-900 dark:text-white hover:text-emerald-600 dark:hover:text-emerald-300 flex flex-col items-center justify-center transition-all cursor-pointer active:scale-95 disabled:opacity-40 disabled:cursor-not-allowed shrink-0"
+              >
+                <Plus className="w-5 h-5 stroke-[2.75]" />
+                <span className="text-[9px] font-black font-gaming leading-none mt-0.5">1M</span>
+              </button>
+            </div>
+
+            {/* Quick Presets (+5m, +10m, +15m from original time) */}
+            <div className="grid grid-cols-3 gap-2 pt-1">
+              {QUICK_PRESET_OFFSETS.map((mins) => (
                 <button
                   key={mins}
                   type="button"
                   disabled={saving}
-                  onClick={() => handleQuickDelay(mins)}
-                  className="py-2.5 px-3 rounded-xl bg-sky-50 hover:bg-sky-600 text-sky-700 hover:text-white dark:bg-sky-500/15 dark:hover:bg-sky-600 dark:text-sky-300 dark:hover:text-white border border-sky-300 dark:border-sky-500/40 font-black font-gaming text-xs tracking-wide transition-all cursor-pointer active:scale-95 disabled:opacity-60"
+                  onClick={() => {
+                    setErrorMsg(null);
+                    setOffsetMinutes(mins);
+                  }}
+                  className={`py-2 px-2 rounded-xl border font-black font-gaming text-xs transition-all cursor-pointer active:scale-95 disabled:opacity-60 ${
+                    offsetMinutes === mins
+                      ? 'bg-sky-600 text-white border-sky-500 shadow-sm'
+                      : 'bg-sky-50 hover:bg-sky-100 text-sky-700 dark:bg-sky-500/15 dark:hover:bg-sky-500/25 dark:text-sky-300 border-sky-300 dark:border-sky-500/40'
+                  }`}
                 >
-                  {activeDelay === mins && saving ? 'Saving...' : `+${mins} Min`}
+                  +{mins} Min
                 </button>
               ))}
             </div>
-          </div>
 
-          {/* Minute-precision Time Picker */}
-          <div className="space-y-2">
-            <label
-              htmlFor="match-time-picker"
-              className="text-[11px] font-bold uppercase tracking-wider text-slate-600 dark:text-slate-300 block"
-            >
-              Custom Time Picker (যেকোনো মিনিট বা ঘন্টা সেট করুন)
-            </label>
-            <div className="flex items-center gap-3">
-              <input
-                id="match-time-picker"
-                type="time"
-                step={60}
-                value={timeInput}
-                onChange={(e) => {
-                  setTimeInput(e.target.value);
-                  setErrorMsg(null);
-                }}
-                disabled={saving}
-                required
-                className="flex-1 px-3.5 py-2.5 rounded-xl bg-slate-50 dark:bg-[#070B18] border border-slate-300 dark:border-slate-700 focus:border-amber-500 dark:focus:border-[#F4D77A] text-slate-900 dark:text-white font-gaming font-bold text-sm focus:outline-none tabular-nums"
-              />
-              <div className="px-3.5 py-2.5 rounded-xl bg-amber-50 dark:bg-[#111D35] border border-amber-300 dark:border-amber-500/35 text-center shrink-0 min-w-[92px]">
-                <span className="text-[9px] uppercase font-bold text-amber-700 dark:text-amber-300 block leading-none mb-0.5">
-                  New Time
-                </span>
-                <span className="text-xs font-black font-gaming text-slate-900 dark:text-white tabular-nums">
-                  {previewSchedule.matchTime}
-                </span>
-              </div>
-            </div>
-            <p className="text-[11px] text-slate-500 dark:text-slate-400">
-              সেভ করলে Home Page, My Matches ও Slot List-এ সাথে সাথে আপডেট হবে এবং জয়েন করা প্লেয়ারদের কাছে নোটিফিকেশন যাবে।
+            <p className="text-[11px] font-bangla text-slate-500 dark:text-slate-400 text-center">
+              সেভ করলে সাথে সাথে Card-এ নতুন Time দেখাবে এবং জয়েন করা প্লেয়ারদের কাছে নোটিফিকেশন যাবে।
             </p>
           </div>
 
           {/* Error Feedback */}
           {errorMsg && (
-            <div className="p-3 rounded-xl bg-red-50 dark:bg-red-950/50 border border-red-300 dark:border-red-500/40 text-red-700 dark:text-red-300 text-xs font-semibold flex items-start gap-2">
+            <div
+              role="alert"
+              className="p-3 rounded-xl bg-red-50 dark:bg-red-950/50 border border-red-300 dark:border-red-500/40 text-red-700 dark:text-red-300 text-xs font-semibold flex items-start gap-2"
+            >
               <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
               <span>{errorMsg}</span>
             </div>
@@ -246,17 +316,17 @@ export const EditMatchTimeModal: React.FC<EditMatchTimeModalProps> = ({
               type="button"
               disabled={saving}
               onClick={onClose}
-              className="py-2.5 px-4 rounded-xl bg-slate-200 hover:bg-slate-300 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-800 dark:text-slate-200 font-bold text-xs transition-colors cursor-pointer disabled:opacity-50"
+              className="min-h-[44px] py-2.5 px-4 rounded-xl bg-slate-200 hover:bg-slate-300 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-800 dark:text-slate-200 font-bold text-xs transition-colors cursor-pointer disabled:opacity-50"
             >
               বাতিল
             </button>
             <button
               type="submit"
               disabled={saving}
-              className="flex-1 py-2.5 px-4 rounded-xl bg-gradient-to-r from-[#CFA84B] via-[#F4D77A] to-[#CFA84B] hover:brightness-110 text-black font-black font-gaming text-xs tracking-wider uppercase transition-all cursor-pointer border border-[#F4D77A]/60 flex items-center justify-center gap-1.5 disabled:opacity-60"
+              className="flex-1 min-h-[44px] py-2.5 px-4 rounded-xl bg-gradient-to-r from-[#CFA84B] via-[#F4D77A] to-[#CFA84B] hover:brightness-110 text-black font-black font-gaming text-xs tracking-wider uppercase transition-all cursor-pointer border border-[#F4D77A]/60 flex items-center justify-center gap-1.5 disabled:opacity-60"
             >
               <Check className="w-4 h-4 stroke-[2.5]" />
-              <span>{saving && activeDelay === null ? 'Updating...' : 'Save New Time'}</span>
+              <span>{saving ? 'Saving...' : 'Save New Time'}</span>
             </button>
           </div>
         </form>

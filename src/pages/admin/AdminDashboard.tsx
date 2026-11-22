@@ -77,16 +77,23 @@ import { doc, getDoc, setDoc, collection, getDocs, onSnapshot } from 'firebase/f
 import { db } from '../../services/firebase';
 import { handleFirestoreError, OperationType } from '../../services/firestoreError';
 import { DeleteTournamentModal } from '../../components/tournament/DeleteTournamentModal';
+import { EditMatchSlotsModal } from '../../components/tournament/EditMatchSlotsModal';
+import { EditMatchTimeModal } from '../../components/tournament/EditMatchTimeModal';
 import { ToastNotification } from '../../components/common/ToastNotification';
 import {
   formatGameModeLabel,
   generateAutoBanglaTitle,
+  getDhakaTodayDateStr,
   getMatchBannerUrl,
+  getMaxSlotLimitForCategory,
+  getSlotWeightForRegistration,
   getTournamentCategory,
   isBuiltInCategoryBannerUrl,
   isPlacementPrizeCategory,
   isPlaceholderBannerUrl,
+  isSlotEditableCategory,
   normalizeCategory,
+  parseMatchDateAndTime,
   supportsPerKillPrize,
 } from '../../constants/categoryRules';
 import { getLiveCategoryRulesText } from '../../services/rulesService';
@@ -107,6 +114,7 @@ import {
   Plus,
   Trash2,
   Edit,
+  Pencil,
   Save,
   MessageSquare,
   Settings,
@@ -283,6 +291,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
 
   // Delete Tournament Modal & Toast state
   const [tournamentToDelete, setTournamentToDelete] = useState<Tournament | null>(null);
+  const [slotEditTour, setSlotEditTour] = useState<Tournament | null>(null);
+  const [timeEditTour, setTimeEditTour] = useState<Tournament | null>(null);
   const [showWipeAllModal, setShowWipeAllModal] = useState(false);
   const [isDeletingTour, setIsDeletingTour] = useState(false);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
@@ -727,6 +737,64 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
 
       const cleanTitle = (editingTour.title || '').trim();
       const autoTitleBn = generateAutoBanglaTitle(cleanTitle);
+      const joinedCount = Math.max(0, Number(editingTour.registeredCount || 0));
+      const parsedEditSlots = Math.max(1, Math.floor(Number(editingTour.maxSlots ?? 24) || 24));
+      if (parsedEditSlots < joinedCount) {
+        setToastMessage(
+          `Already ${joinedCount} জন জয়েন করেছে! এর কম Slot করা যাবে না।`
+        );
+        return;
+      }
+      if (isSlotEditableCategory(selectedCat)) {
+        const categorySlotCap = getMaxSlotLimitForCategory(selectedCat);
+        if (categorySlotCap !== null && parsedEditSlots > categorySlotCap) {
+          setToastMessage(
+            `${isFreeMatch ? 'SPECIAL MATCH' : 'BR MATCH'}-এ সর্বোচ্চ ${categorySlotCap} Slot পর্যন্ত করা যাবে!`
+          );
+          return;
+        }
+      }
+
+      const prevTour = tournaments.find((item) => item.id === editingTour.id);
+      const todayDhakaStr = getDhakaTodayDateStr();
+      let resolvedMatchDate = (editingTour.matchDate || todayDhakaStr).trim();
+      const resolvedMatchTime = (editingTour.matchTime || '').trim();
+      let editedMatchTarget = parseMatchDateAndTime(resolvedMatchDate, resolvedMatchTime);
+      const nowMs = Date.now();
+      if (editedMatchTarget && editedMatchTarget.getTime() <= nowMs) {
+        const todayTarget = parseMatchDateAndTime(todayDhakaStr, resolvedMatchTime);
+        if (todayTarget && todayTarget.getTime() > nowMs) {
+          resolvedMatchDate = todayDhakaStr;
+          editedMatchTarget = todayTarget;
+        }
+      }
+
+      let nextStatus = editingTour.status;
+      if (
+        nextStatus !== 'COMPLETED' &&
+        nextStatus !== 'CANCELLED' &&
+        editedMatchTarget &&
+        editedMatchTarget.getTime() > nowMs &&
+        nextStatus === 'ONGOING'
+      ) {
+        nextStatus =
+          joinedCount > 0 && parsedEditSlots <= joinedCount
+            ? 'REGISTRATION_FULL'
+            : 'REGISTRATION_OPEN';
+      } else if (nextStatus === 'REGISTRATION_FULL' && parsedEditSlots > joinedCount) {
+        nextStatus = 'REGISTRATION_OPEN';
+      } else if (
+        nextStatus === 'REGISTRATION_OPEN' &&
+        joinedCount > 0 &&
+        parsedEditSlots <= joinedCount
+      ) {
+        nextStatus = 'REGISTRATION_FULL';
+      }
+
+      const scheduleChangedByAdmin =
+        !prevTour ||
+        prevTour.matchTime !== resolvedMatchTime ||
+        prevTour.matchDate !== resolvedMatchDate;
 
       await updateTournament(editingTour.id, {
         title: cleanTitle,
@@ -745,10 +813,16 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
         perKillPrize: supportsPerKillPrize(selectedCat)
           ? Math.max(0, Number(editingTour.perKillPrize ?? 0) || 0)
           : 0,
-        maxSlots: Math.max(1, Number(editingTour.maxSlots ?? 24) || 24),
-        status: editingTour.status,
-        matchDate: editingTour.matchDate,
-        matchTime: editingTour.matchTime,
+        maxSlots: parsedEditSlots,
+        status: nextStatus,
+        matchDate: resolvedMatchDate,
+        matchTime: resolvedMatchTime,
+        ...(scheduleChangedByAdmin
+          ? {
+              originalMatchDate: resolvedMatchDate,
+              originalMatchTime: resolvedMatchTime,
+            }
+          : {}),
         bannerUrl:
           !isPlaceholderBannerUrl(editingTour.bannerUrl) &&
           !isBuiltInCategoryBannerUrl(editingTour.bannerUrl)
@@ -1882,19 +1956,33 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                           <MapPin className="w-3 h-3" />
                           {t.map || 'Bermuda'}
                         </span>
-                        <span
-                          className={`px-2.5 py-0.5 rounded-md text-[10px] font-bold font-gaming ${
-                            t.status === 'REGISTRATION_OPEN'
-                              ? 'bg-emerald-950 text-emerald-400 border border-emerald-500/30'
-                              : t.status === 'ONGOING'
-                              ? 'bg-amber-950 text-amber-400 border border-amber-500/30'
-                              : t.status === 'COMPLETED'
-                              ? 'bg-blue-950 text-blue-400 border border-blue-500/30'
-                              : 'bg-slate-800 text-slate-400'
-                          }`}
-                        >
-                          {t.status}
-                        </span>
+                        {(() => {
+                          const matchStart = parseMatchDateAndTime(t.matchDate, t.matchTime);
+                          let effectiveAdminStatus: string = t.status;
+                          if (t.status !== 'COMPLETED' && t.status !== 'CANCELLED' && matchStart) {
+                            effectiveAdminStatus =
+                              matchStart.getTime() <= Date.now()
+                                ? 'ONGOING'
+                                : t.registeredCount >= t.maxSlots
+                                ? 'REGISTRATION_FULL'
+                                : 'REGISTRATION_OPEN';
+                          }
+                          return (
+                            <span
+                              className={`px-2.5 py-0.5 rounded-md text-[10px] font-bold font-gaming ${
+                                effectiveAdminStatus === 'REGISTRATION_OPEN'
+                                  ? 'bg-emerald-950 text-emerald-400 border border-emerald-500/30'
+                                  : effectiveAdminStatus === 'ONGOING'
+                                  ? 'bg-amber-950 text-amber-400 border border-amber-500/30'
+                                  : effectiveAdminStatus === 'COMPLETED'
+                                  ? 'bg-blue-950 text-blue-400 border border-blue-500/30'
+                                  : 'bg-slate-800 text-slate-400'
+                              }`}
+                            >
+                              {effectiveAdminStatus}
+                            </span>
+                          );
+                        })()}
                       </div>
 
                       <div className="flex flex-wrap items-center gap-2">
@@ -1967,9 +2055,21 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                             <Calendar className="w-3.5 h-3.5 text-sky-400" />
                             {t.matchDate}
                           </span>
-                          <span className="flex items-center gap-1 text-slate-300">
+                          <span className="inline-flex items-center gap-1.5 text-slate-300">
                             <Clock className="w-3.5 h-3.5 text-sky-400" />
-                            {t.matchTime}
+                            <span>{t.matchTime}</span>
+                            {t.status !== 'COMPLETED' &&
+                              t.status !== 'CANCELLED' && (
+                                <button
+                                  type="button"
+                                  onClick={() => setTimeEditTour(t)}
+                                  title="Edit Match Time"
+                                  aria-label="Edit Match Time"
+                                  className="p-0.5 rounded bg-amber-400/95 hover:bg-amber-300 text-black shadow-sm transition-all cursor-pointer active:scale-95"
+                                >
+                                  <Pencil className="w-2.5 h-2.5 stroke-[2.5]" />
+                                </button>
+                              )}
                           </span>
                           <span className="text-slate-400">
                             ফি: <b className="text-white">{formatBDT(t.entryFee)}</b>
@@ -1991,8 +2091,23 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                               প্রতি কিল: <b className="text-amber-300">{formatBDT(t.perKillPrize ?? 0)}</b>
                             </span>
                           )}
-                          <span className="text-slate-400">
-                            স্লট: <b className="text-sky-300">{t.registeredCount} / {t.maxSlots}</b>
+                          <span className="inline-flex items-center gap-1.5 text-slate-400">
+                            <span>
+                              স্লট: <b className="text-sky-300">{t.registeredCount} / {t.maxSlots}</b>
+                            </span>
+                            {isSlotEditableCategory(getTournamentCategory(t)) &&
+                              t.status !== 'COMPLETED' &&
+                              t.status !== 'CANCELLED' && (
+                                <button
+                                  type="button"
+                                  onClick={() => setSlotEditTour(t)}
+                                  title="Edit Slots"
+                                  aria-label="Edit Slots"
+                                  className="p-0.5 rounded bg-amber-400/95 hover:bg-amber-300 text-black shadow-sm transition-all cursor-pointer active:scale-95"
+                                >
+                                  <Pencil className="w-2.5 h-2.5 stroke-[2.5]" />
+                                </button>
+                              )}
                           </span>
                         </div>
                       </div>
@@ -3148,17 +3263,35 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                           <span className="px-2 py-0.5 rounded text-[10px] font-bold font-gaming bg-[#111D35] text-sky-300 border border-slate-700">
                             {tour.type} • {tour.map || 'Bermuda'}
                           </span>
-                          <span
-                            className={`px-2 py-0.5 rounded text-[10px] font-bold font-gaming ${
-                              tour.status === 'COMPLETED'
-                                ? 'bg-emerald-950 text-emerald-400 border border-emerald-500/30'
-                                : tour.status === 'ONGOING'
-                                ? 'bg-amber-950 text-amber-400 border border-amber-500/30'
-                                : 'bg-sky-950 text-sky-400 border border-sky-500/30'
-                            }`}
-                          >
-                            {tour.status}
-                          </span>
+                          {(() => {
+                            const matchStart = parseMatchDateAndTime(tour.matchDate, tour.matchTime);
+                            let effectiveRoomTourStatus: string = tour.status;
+                            if (
+                              tour.status !== 'COMPLETED' &&
+                              tour.status !== 'CANCELLED' &&
+                              matchStart
+                            ) {
+                              effectiveRoomTourStatus =
+                                matchStart.getTime() <= Date.now()
+                                  ? 'ONGOING'
+                                  : tour.registeredCount >= tour.maxSlots
+                                  ? 'REGISTRATION_FULL'
+                                  : 'REGISTRATION_OPEN';
+                            }
+                            return (
+                              <span
+                                className={`px-2 py-0.5 rounded text-[10px] font-bold font-gaming ${
+                                  effectiveRoomTourStatus === 'COMPLETED'
+                                    ? 'bg-emerald-950 text-emerald-400 border border-emerald-500/30'
+                                    : effectiveRoomTourStatus === 'ONGOING'
+                                    ? 'bg-amber-950 text-amber-400 border border-amber-500/30'
+                                    : 'bg-sky-950 text-sky-400 border border-sky-500/30'
+                                }`}
+                              >
+                                {effectiveRoomTourStatus}
+                              </span>
+                            );
+                          })()}
                         </div>
                         <h4 className="text-base font-black text-white">{tour.title}</h4>
                         <p className="text-[11px] text-slate-400 mt-0.5">
@@ -3180,7 +3313,11 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                         <div className="px-3 py-1.5 rounded-xl bg-[#111D35] border border-slate-800">
                           <span className="text-[10px] text-slate-400 block">Slots</span>
                           <span className="font-bold text-sky-300">
-                            {regs.length || tour.registeredCount || 0} / {tour.maxSlots}
+                            {regs.reduce(
+                              (sum, r) => sum + getSlotWeightForRegistration(tour, r.players),
+                              0
+                            ) || tour.registeredCount || 0}{' '}
+                            / {tour.maxSlots}
                           </span>
                         </div>
                       </div>
@@ -4529,6 +4666,32 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
           </div>
         </div>
       )}
+
+      {/* Edit Match Slots Modal (All Matches) */}
+      <EditMatchSlotsModal
+        isOpen={!!slotEditTour}
+        tournament={slotEditTour}
+        onClose={() => setSlotEditTour(null)}
+        onSuccess={(updated, message) => {
+          setTournaments((prev) =>
+            prev.map((item) => (item.id === updated.id ? updated : item))
+          );
+          setToastMessage(message);
+        }}
+      />
+
+      {/* Edit Match Time Modal (All Matches) */}
+      <EditMatchTimeModal
+        isOpen={!!timeEditTour}
+        tournament={timeEditTour}
+        onClose={() => setTimeEditTour(null)}
+        onSuccess={(updated, message) => {
+          setTournaments((prev) =>
+            prev.map((item) => (item.id === updated.id ? updated : item))
+          );
+          setToastMessage(message);
+        }}
+      />
 
       {/* Toast Notification */}
       <ToastNotification

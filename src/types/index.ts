@@ -114,6 +114,8 @@ export interface Tournament {
   status: TournamentStatus;
   matchDate: string;
   matchTime: string;
+  originalMatchDate?: string;
+  originalMatchTime?: string;
   registrationDeadline: string;
   rules: string;
   rulesBn: string;

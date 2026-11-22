@@ -617,6 +617,12 @@ export const Home: React.FC<HomeProps> = ({ onNavigate, onJoinClick, onNavigateL
                     );
                     setToastMessage(message);
                   }}
+                  onSlotsUpdated={(updated, message) => {
+                    setTournaments((prev) =>
+                      prev.map((item) => (item.id === updated.id ? updated : item))
+                    );
+                    setToastMessage(message);
+                  }}
                   isRegistered={effectiveRegisteredTourIds.has(tournament.id)}
                   refreshTick={refreshTick}
                 />

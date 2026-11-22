@@ -32,7 +32,14 @@ import { getSavedPlayerSession } from './playerAuthService';
 import { getActiveBiometricSession } from './biometricAuthService';
 import { isUserCurrentlyBanned, getBanErrorMessage } from './banService';
 import {
+  countsPlayersPerSlotForCategory,
+  format24HourToDisplayTime,
+  getDhakaDateTimeParts,
+  getDhakaTodayDateStr,
+  getMaxSlotLimitForCategory,
+  getSlotWeightForRegistration,
   getTournamentCategory,
+  isSlotEditableCategory,
   parseMatchDateAndTime,
   supportsPerKillPrize,
 } from '../constants/categoryRules';
@@ -70,10 +77,74 @@ export async function fetchTournaments(): Promise<Tournament[]> {
       list.push({ ...(d.data() as Tournament), id: d.id });
     });
     // Sort by createdAt desc and merge any optimistic creations not yet reflected on server
-    return mergeOptimisticTournaments(list);
+    const merged = mergeOptimisticTournaments(list);
+    // Non-blocking background sync if any active team match had legacy +1 count per registration
+    void reconcileStaleTeamTournamentCounts(merged).catch(() => {});
+    return merged;
   } catch (err) {
     handleFirestoreError(err, OperationType.GET, 'tournaments');
   }
+}
+
+const reconciledTournamentIds = new Set<string>();
+
+export async function reconcileSingleTournamentCount(tournamentId: string): Promise<void> {
+  if (!tournamentId) return;
+  try {
+    const tourRef = doc(db, 'tournaments', tournamentId);
+    const [tourSnap, regSnap] = await Promise.all([
+      getDocFromServer(tourRef).catch(() => getDoc(tourRef)),
+      getDocsFromServer(
+        query(collection(db, 'registrations'), where('tournamentId', '==', tournamentId))
+      ).catch(() =>
+        getDocs(query(collection(db, 'registrations'), where('tournamentId', '==', tournamentId)))
+      ),
+    ]);
+    if (!tourSnap.exists()) return;
+    const tourData = { ...(tourSnap.data() as Tournament), id: tourSnap.id };
+    if (!countsPlayersPerSlotForCategory(tourData)) return;
+    const statusUpper = String(tourData.status || 'REGISTRATION_OPEN').toUpperCase();
+    if (statusUpper === 'COMPLETED' || statusUpper === 'CANCELLED') return;
+
+    let actualPlayerCount = 0;
+    regSnap.forEach((d) => {
+      const reg = d.data() as TournamentRegistration;
+      if (reg.status === 'CANCELLED' || reg.status === 'REJECTED') return;
+      actualPlayerCount += getSlotWeightForRegistration(tourData, reg.players);
+    });
+
+    const maxSlots = Math.max(1, Number(tourData.maxSlots) || 1);
+    const clampedCount = Math.min(maxSlots, Math.max(0, actualPlayerCount));
+    const currentStoredCount = Math.max(0, Number(tourData.registeredCount) || 0);
+
+    if (clampedCount !== currentStoredCount) {
+      let nextStatus = tourData.status || 'REGISTRATION_OPEN';
+      if (statusUpper !== 'ONGOING') {
+        nextStatus = clampedCount >= maxSlots ? 'REGISTRATION_FULL' : 'REGISTRATION_OPEN';
+      }
+      await updateDoc(tourRef, {
+        registeredCount: clampedCount,
+        status: nextStatus,
+        updatedAt: new Date().toISOString(),
+      });
+    }
+  } catch {
+    // Non-fatal background reconciliation
+  }
+}
+
+async function reconcileStaleTeamTournamentCounts(tournaments: Tournament[]): Promise<void> {
+  const candidates = tournaments.filter((t) => {
+    if (!t.id || reconciledTournamentIds.has(t.id)) return false;
+    const statusUpper = String(t.status || 'REGISTRATION_OPEN').toUpperCase();
+    if (statusUpper === 'COMPLETED' || statusUpper === 'CANCELLED') return false;
+    if ((Number(t.registeredCount) || 0) <= 0) return false;
+    if (t.type === 'SOLO') return false;
+    return countsPlayersPerSlotForCategory(t);
+  });
+  if (candidates.length === 0) return;
+  candidates.forEach((t) => reconciledTournamentIds.add(t.id));
+  await Promise.all(candidates.map((t) => reconcileSingleTournamentCount(t.id)));
 }
 
 export async function fetchTournamentById(id: string): Promise<Tournament | null> {
@@ -124,14 +195,24 @@ export async function joinTournament(
       if (!tourSnap.exists()) {
         throw new Error('টুর্নামেন্টটি খুঁজে পাওয়া যায়নি!');
       }
-      const currentTour = tourSnap.data() as Tournament;
+      const currentTour = { ...(tourSnap.data() as Tournament), id: tourSnap.id };
 
       if (currentTour.status === 'COMPLETED' || currentTour.status === 'CANCELLED') {
         throw new Error('এই টুর্নামেন্টটি বন্ধ হয়ে গেছে!');
       }
 
-      if (currentTour.registeredCount >= currentTour.maxSlots) {
+      const slotWeight = getSlotWeightForRegistration(currentTour, players);
+      const currentRegistered = Math.max(0, Number(currentTour.registeredCount) || 0);
+      const remainingSlots = Math.max(0, currentTour.maxSlots - currentRegistered);
+
+      if (remainingSlots <= 0) {
         throw new Error('দুঃখিত, টুর্নামেন্টের সমস্ত স্লট বুক হয়ে গেছে! (Slots Full)');
+      }
+
+      if (currentRegistered + slotWeight > currentTour.maxSlots) {
+        throw new Error(
+          `দুঃখিত! এই ম্যাচে মাত্র ${remainingSlots} টি স্লট খালি আছে, তাই ${slotWeight} জনের নাম দিয়ে জয়েন করা যাবে না!`
+        );
       }
 
       // 3. Check user ban status & wallet balance
@@ -175,8 +256,9 @@ export async function joinTournament(
         updatedAt: new Date().toISOString(),
       });
 
-      // 5. Update tournament registered count
-      const newRegisteredCount = (currentTour.registeredCount || 0) + 1;
+      // 5. Update tournament registered count by real player count (1 for Lost To Win / Special Match)
+      const slotNumber = currentRegistered + 1;
+      const newRegisteredCount = currentRegistered + slotWeight;
       const newStatus =
         newRegisteredCount >= currentTour.maxSlots
           ? 'REGISTRATION_FULL'
@@ -189,7 +271,6 @@ export async function joinTournament(
       });
 
       // 6. Create registration record
-      const slotNumber = newRegisteredCount;
       const playerUids = players.map((p) => p.uid || '').filter(Boolean);
       if (!playerUids.includes(userId)) playerUids.push(userId);
 
@@ -289,9 +370,14 @@ export function joinTournamentInstant(params: {
   } = params;
 
   const regId = `${userId}_${tournament.id}`;
+  const slotWeight = getSlotWeightForRegistration(tournament, players);
   const predictedSlot = Math.min(
     Math.max(1, Number(tournament.maxSlots) || 1),
     Math.max(0, Number(tournament.registeredCount) || 0) + 1
+  );
+  const predictedEndSlot = Math.min(
+    Math.max(1, Number(tournament.maxSlots) || 1),
+    Math.max(0, Number(tournament.registeredCount) || 0) + slotWeight
   );
   const playerUids = Array.from(
     new Set([userId, ...players.map((p) => p.uid || '').filter(Boolean)])
@@ -357,7 +443,10 @@ export function joinTournamentInstant(params: {
   return {
     started: true,
     registration: optimisticRegistration,
-    message: `Slot #${predictedSlot} Confirmed!`,
+    message:
+      slotWeight > 1
+        ? `Slot #${predictedSlot}-#${predictedEndSlot} Confirmed!`
+        : `Slot #${predictedSlot} Confirmed!`,
   };
 }
 
@@ -865,33 +954,80 @@ export async function updateMatchTimeWithNotification(params: {
 
     const currentTour = { ...(tourSnap.data() as Tournament), id: tourSnap.id };
     const statusUpper = String(currentTour.status || '').toUpperCase();
-    if (
-      statusUpper === 'ONGOING' ||
-      statusUpper === 'COMPLETED' ||
-      statusUpper === 'CANCELLED'
-    ) {
+    if (statusUpper === 'COMPLETED' || statusUpper === 'CANCELLED') {
       return {
         success: false,
-        message: 'ম্যাচ ইতিমধ্যে শুরু বা শেষ হয়ে গেছে — এখন আর Time Edit করা যাবে না!',
+        message: 'ম্যাচ ইতিমধ্যে শেষ বা বাতিল হয়ে গেছে — এখন আর Time Edit করা যাবে না!',
         notifiedCount: 0,
       };
     }
 
-    const currentStart = parseMatchDateAndTime(currentTour.matchDate, currentTour.matchTime);
-    if (currentStart && currentStart.getTime() <= Date.now()) {
-      return {
-        success: false,
-        message: 'ম্যাচের সময় ইতিমধ্যে হয়ে গেছে (Match Started) — এখন আর Time Edit করা যাবে না!',
-        notifiedCount: 0,
-      };
+    const todayStr = getDhakaTodayDateStr();
+    const nowMs = Date.now();
+
+    let anchorDate = (currentTour.originalMatchDate || currentTour.matchDate || todayStr).trim();
+    const anchorTime = (currentTour.originalMatchTime || currentTour.matchTime || cleanTime).trim();
+    let resolvedDate = (newMatchDate || currentTour.matchDate || anchorDate).trim();
+
+    let anchorDateObj = parseMatchDateAndTime(anchorDate, anchorTime);
+    let targetDateObj = parseMatchDateAndTime(resolvedDate, cleanTime);
+
+    // If the stored matchDate is from a previous day while the edited time today is upcoming,
+    // align the date to today (Asia/Dhaka) so status & countdown reflect the edited time properly.
+    if (targetDateObj && targetDateObj.getTime() <= nowMs) {
+      const todayTargetObj = parseMatchDateAndTime(todayStr, cleanTime);
+      if (todayTargetObj && todayTargetObj.getTime() > nowMs) {
+        resolvedDate = todayStr;
+        targetDateObj = todayTargetObj;
+        if (anchorDateObj && anchorDateObj.getTime() <= nowMs) {
+          const todayAnchorObj = parseMatchDateAndTime(todayStr, anchorTime);
+          if (todayAnchorObj) {
+            anchorDate = todayStr;
+            anchorDateObj = todayAnchorObj;
+          }
+        }
+      }
     }
 
-    const resolvedDate = (newMatchDate || currentTour.matchDate || '').trim();
+    if (anchorDateObj && targetDateObj) {
+      const diffMinutes = Math.round((targetDateObj.getTime() - anchorDateObj.getTime()) / 60000);
+      if (diffMinutes < 0) {
+        return {
+          success: false,
+          message: `মূল সময় (${anchorTime}) এর আগে Time কমানো যাবে না!`,
+          notifiedCount: 0,
+        };
+      }
+      if (diffMinutes > 15) {
+        const maxObj = new Date(anchorDateObj.getTime() + 15 * 60 * 1000);
+        const maxParts = getDhakaDateTimeParts(maxObj);
+        const maxDisplay = format24HourToDisplayTime(maxParts.hours, maxParts.minutes);
+        return {
+          success: false,
+          message: `সর্বোচ্চ ১৫ মিনিট পর্যন্ত (${maxDisplay}) Time বাড়ানো যাবে! এর বেশি নয়।`,
+          notifiedCount: 0,
+        };
+      }
+    }
+
+    const currentJoined = Math.max(0, Number(currentTour.registeredCount) || 0);
+    const maxSlots = Math.max(1, Number(currentTour.maxSlots) || 1);
+    let nextStatus = currentTour.status || 'REGISTRATION_OPEN';
+
+    if (targetDateObj && targetDateObj.getTime() > nowMs) {
+      if (statusUpper === 'ONGOING' || statusUpper === 'UPCOMING' || statusUpper === 'OPEN') {
+        nextStatus = currentJoined >= maxSlots ? 'REGISTRATION_FULL' : 'REGISTRATION_OPEN';
+      }
+    }
+
     const nowIso = new Date().toISOString();
 
     await updateDoc(tourRef, {
       matchTime: cleanTime,
       matchDate: resolvedDate,
+      originalMatchTime: anchorTime,
+      originalMatchDate: anchorDate,
+      status: nextStatus,
       updatedAt: nowIso,
     });
 
@@ -899,6 +1035,9 @@ export async function updateMatchTimeWithNotification(params: {
       ...currentTour,
       matchTime: cleanTime,
       matchDate: resolvedDate,
+      originalMatchTime: anchorTime,
+      originalMatchDate: anchorDate,
+      status: nextStatus,
       updatedAt: nowIso,
     };
 
@@ -989,4 +1128,258 @@ export async function updateMatchTimeWithNotification(params: {
     };
   }
 }
+
+export async function updateTournamentMaxSlots(params: {
+  tournamentId: string;
+  newMaxSlots: number;
+}): Promise<{
+  success: boolean;
+  message: string;
+  updatedTournament?: Tournament;
+}> {
+  const { tournamentId, newMaxSlots } = params;
+  const parsedSlots = Math.floor(Number(newMaxSlots));
+
+  if (!Number.isFinite(parsedSlots) || parsedSlots < 1) {
+    return {
+      success: false,
+      message: 'সঠিক Slot সংখ্যা দিন (কমপক্ষে 1 হতে হবে)।',
+    };
+  }
+
+  const isAllowed = await verifyCurrentActorIsAdmin();
+  if (!isAllowed) {
+    return {
+      success: false,
+      message: 'শুধুমাত্র অ্যাডমিনরা ম্যাচের Slot পরিবর্তন করতে পারবেন!',
+    };
+  }
+
+  try {
+    const tourRef = doc(db, 'tournaments', tournamentId);
+    const updatedTournament = await runTransaction(db, async (txn) => {
+      const tourSnap = await txn.get(tourRef);
+      if (!tourSnap.exists()) {
+        throw new Error('টুর্নামেন্টটি খুঁজে পাওয়া যায়নি!');
+      }
+
+      const currentTour = { ...(tourSnap.data() as Tournament), id: tourSnap.id };
+      const category = getTournamentCategory(currentTour);
+
+      if (!isSlotEditableCategory(category)) {
+        throw new Error('এই ম্যাচের Slot Edit করা যাবে না!');
+      }
+
+      const statusUpper = String(currentTour.status || 'REGISTRATION_OPEN').toUpperCase();
+      if (statusUpper === 'COMPLETED' || statusUpper === 'CANCELLED') {
+        throw new Error('ম্যাচটি ইতিমধ্যে শেষ বা বাতিল হয়ে গেছে — এখন Slot পরিবর্তন করা যাবে না!');
+      }
+
+      const currentJoined = Math.max(0, Number(currentTour.registeredCount) || 0);
+      const minAllowed = Math.max(1, currentJoined);
+      const maxAllowed = getMaxSlotLimitForCategory(category);
+      const matchLabel = category === 'FREE MATCH' ? 'SPECIAL MATCH' : category;
+
+      if (parsedSlots < minAllowed) {
+        throw new Error(
+          currentJoined > 0
+            ? `Already ${currentJoined} জন জয়েন করেছে! ${currentJoined} এর কম Slot করা যাবে না।`
+            : 'Slot সংখ্যা কমপক্ষে 1 হতে হবে!'
+        );
+      }
+
+      if (maxAllowed !== null && parsedSlots > maxAllowed) {
+        throw new Error(`${matchLabel}-এ সর্বোচ্চ ${maxAllowed} Slot পর্যন্ত করা যাবে!`);
+      }
+
+      let nextStatus = currentTour.status || 'REGISTRATION_OPEN';
+      if (statusUpper === 'REGISTRATION_FULL' && parsedSlots > currentJoined) {
+        nextStatus = 'REGISTRATION_OPEN';
+      } else if (
+        (statusUpper === 'REGISTRATION_OPEN' || statusUpper === 'OPEN') &&
+        currentJoined > 0 &&
+        parsedSlots <= currentJoined
+      ) {
+        nextStatus = 'REGISTRATION_FULL';
+      }
+
+      const nowIso = new Date().toISOString();
+      txn.update(tourRef, {
+        maxSlots: parsedSlots,
+        status: nextStatus,
+        updatedAt: nowIso,
+      });
+
+      return {
+        ...currentTour,
+        maxSlots: parsedSlots,
+        status: nextStatus,
+        updatedAt: nowIso,
+      } as Tournament;
+    });
+
+    return {
+      success: true,
+      updatedTournament,
+      message: `Total Slot সফলভাবে ${parsedSlots} করা হয়েছে!`,
+    };
+  } catch (err: unknown) {
+    if (err instanceof Error && err.message.includes('Missing or insufficient permissions')) {
+      handleFirestoreError(err, OperationType.UPDATE, `tournaments/${tournamentId}`);
+    }
+    return {
+      success: false,
+      message: err instanceof Error ? err.message : 'Slot আপডেট করতে সমস্যা হয়েছে।',
+    };
+  }
+}
+
+export async function updateRegistrationPlayerName(params: {
+  registrationId: string;
+  tournamentId: string;
+  actorUserId: string;
+  playerIndex?: number;
+  newPlayerName: string;
+}): Promise<{
+  success: boolean;
+  message: string;
+  updatedRegistration?: TournamentRegistration;
+}> {
+  const {
+    registrationId,
+    tournamentId,
+    actorUserId,
+    playerIndex = 0,
+    newPlayerName,
+  } = params;
+
+  const trimmedName = (newPlayerName || '').trim();
+  if (!trimmedName) {
+    return {
+      success: false,
+      message: 'অনুগ্রহ করে নতুন প্লেয়ারের নাম লিখুন!',
+    };
+  }
+  if (trimmedName.length > 40) {
+    return {
+      success: false,
+      message: 'প্লেয়ারের নাম সর্বোচ্চ ৪০ অক্ষরের মধ্যে হতে হবে!',
+    };
+  }
+  if (!actorUserId || !registrationId || !tournamentId) {
+    return {
+      success: false,
+      message: 'স্লটের তথ্য পাওয়া যায়নি। অনুগ্রহ করে আবার চেষ্টা করুন।',
+    };
+  }
+
+  try {
+    const tourRef = doc(db, 'tournaments', tournamentId);
+    const regRef = doc(db, 'registrations', registrationId);
+
+    const updatedRegistration = await runTransaction(db, async (txn) => {
+      const tourSnap = await txn.get(tourRef);
+      if (!tourSnap.exists()) {
+        throw new Error('টুর্নামেন্টটি খুঁজে পাওয়া যায়নি!');
+      }
+
+      const tourData = { ...(tourSnap.data() as Tournament), id: tourSnap.id };
+      const statusUpper = String(tourData.status || 'REGISTRATION_OPEN').toUpperCase();
+      if (statusUpper === 'COMPLETED' || statusUpper === 'CANCELLED') {
+        throw new Error('ম্যাচ ইতিমধ্যে শেষ বা বাতিল হয়ে গেছে — এখন আর নাম পরিবর্তন করা যাবে না!');
+      }
+
+      const matchStart = parseMatchDateAndTime(tourData.matchDate, tourData.matchTime);
+      const hasStarted =
+        (matchStart && matchStart.getTime() <= Date.now()) ||
+        (!matchStart && statusUpper === 'ONGOING');
+      if (hasStarted) {
+        throw new Error('ম্যাচ শুরু (Started / Live) হয়ে গেছে — এখন আর নাম Edit করা যাবে না!');
+      }
+
+      const regSnap = await txn.get(regRef);
+      if (!regSnap.exists()) {
+        throw new Error('আপনার স্লটটি খুঁজে পাওয়া যায়নি!');
+      }
+
+      const regData = { ...(regSnap.data() as TournamentRegistration), id: regSnap.id };
+      if (regData.userId !== actorUserId) {
+        throw new Error('শুধুমাত্র যিনি এই Slot জয়েন করেছেন, তিনিই নিজের Slot এর নাম Edit করতে পারবেন!');
+      }
+
+      if (regData.status === 'CANCELLED' || regData.status === 'REJECTED') {
+        throw new Error('এই রেজিস্ট্রেশনটি বাতিল হয়ে গেছে!');
+      }
+
+      const targetIndex = Math.max(0, Math.floor(Number(playerIndex) || 0));
+      const existingPlayers = Array.isArray(regData.players)
+        ? regData.players.map((p) => ({ ...p }))
+        : [];
+
+      if (targetIndex < existingPlayers.length) {
+        existingPlayers[targetIndex] = {
+          ...existingPlayers[targetIndex],
+          name: trimmedName,
+          inGameName: trimmedName,
+        };
+      } else if (targetIndex === 0) {
+        existingPlayers.push({
+          uid: regData.userId,
+          name: trimmedName,
+          inGameName: trimmedName,
+          freeFireUid: '',
+        });
+      } else {
+        throw new Error('প্লেয়ারের তথ্য খুঁজে পাওয়া যায়নি!');
+      }
+
+      let nextUserName = regData.userName;
+      let nextTeamName = regData.teamName || '';
+
+      if (targetIndex === 0) {
+        nextUserName = trimmedName;
+        const p2Raw = existingPlayers[1]?.inGameName || existingPlayers[1]?.name || '';
+        const hasRealPartner =
+          Boolean(p2Raw) && !p2Raw.includes('Partner: -') && !p2Raw.includes('Solo');
+        if (regData.type === 'DUO' && hasRealPartner) {
+          nextTeamName = `${trimmedName} & ${p2Raw}`;
+        } else if (regData.type === 'SOLO' || (regData.type === 'DUO' && !hasRealPartner)) {
+          nextTeamName = trimmedName;
+        }
+      } else if (targetIndex === 1 && regData.type === 'DUO') {
+        const p1Name =
+          existingPlayers[0]?.inGameName || existingPlayers[0]?.name || regData.userName;
+        nextTeamName = `${p1Name} & ${trimmedName}`;
+      }
+
+      txn.update(regRef, {
+        players: existingPlayers,
+        userName: nextUserName,
+        teamName: nextTeamName,
+      });
+
+      return {
+        ...regData,
+        players: existingPlayers,
+        userName: nextUserName,
+        teamName: nextTeamName,
+      } as TournamentRegistration;
+    });
+
+    return {
+      success: true,
+      updatedRegistration,
+      message: `Slot #${updatedRegistration.slotNumber} এর নাম সফলভাবে "${trimmedName}" করা হয়েছে!`,
+    };
+  } catch (err: unknown) {
+    if (err instanceof Error && err.message.includes('Missing or insufficient permissions')) {
+      handleFirestoreError(err, OperationType.UPDATE, `registrations/${registrationId}`);
+    }
+    return {
+      success: false,
+      message: err instanceof Error ? err.message : 'নাম পরিবর্তন করতে সমস্যা হয়েছে।',
+    };
+  }
+}
+
 

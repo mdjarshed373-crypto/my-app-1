@@ -4,6 +4,8 @@ import { Tournament, TournamentRegistration, RoomCredential } from '../../types'
 import { useLanguage } from '../../context/LanguageContext';
 import { useAuth } from '../../context/AuthContext';
 import {
+  buildExpandedMatchSlots,
+  countsPlayersPerSlotForCategory,
   formatEntryTypeLabel,
   formatMatchDateTimeLabel,
   formatMatchMapLabel,
@@ -11,8 +13,10 @@ import {
   getDefaultBanglaSubtitle,
   getMatchBannerUrl,
   getMatchTypeBadgeLabel,
+  getSlotWeightForRegistration,
   getTournamentCategory,
   isPlacementPrizeCategory,
+  isSlotEditableCategory,
   parseMatchDateAndTime,
   resolveTournamentBannerUrl,
   supportsPerKillPrize,
@@ -21,6 +25,7 @@ import {
   fetchRegistrationsForTournament,
   fetchRoomCredentials,
   fetchUserRegistrations,
+  reconcileSingleTournamentCount,
 } from '../../services/tournamentService';
 import {
   OptimisticJoinEntry,
@@ -28,6 +33,7 @@ import {
 } from '../../services/optimisticJoinStore';
 import { isUserAdminAccount } from '../../utils/adminAuth';
 import { EditMatchTimeModal } from './EditMatchTimeModal';
+import { EditMatchSlotsModal } from './EditMatchSlotsModal';
 import {
   Clock,
   Trophy,
@@ -53,6 +59,7 @@ export interface MatchCardProps {
   onJoin: (tournament: Tournament) => void;
   onDelete?: (tournament: Tournament) => void;
   onTimeUpdated?: (updatedTournament: Tournament, message: string) => void;
+  onSlotsUpdated?: (updatedTournament: Tournament, message: string) => void;
   isRegistered?: boolean;
   refreshTick?: number;
 }
@@ -64,6 +71,7 @@ export const MatchCard: React.FC<MatchCardProps> = ({
   onJoin,
   onDelete,
   onTimeUpdated,
+  onSlotsUpdated,
   isRegistered = false,
   refreshTick,
 }) => {
@@ -73,6 +81,7 @@ export const MatchCard: React.FC<MatchCardProps> = ({
   const [now, setNow] = useState<Date>(() => new Date());
   const [localTournament, setLocalTournament] = useState<Tournament>(tournament);
   const [showEditTimeModal, setShowEditTimeModal] = useState(false);
+  const [showEditSlotsModal, setShowEditSlotsModal] = useState(false);
   const [optimisticJoin, setOptimisticJoin] = useState<OptimisticJoinEntry | null>(null);
 
   // Popups State (SLOTS, ROOM, PRIZES)
@@ -147,10 +156,22 @@ export const MatchCard: React.FC<MatchCardProps> = ({
   const title =
     language === 'bn' && activeTournament.titleBn ? activeTournament.titleBn : activeTournament.title;
   const maxSlots = Math.max(1, Number(activeTournament.maxSlots) || 1);
+  const usePlayerPerSlot = countsPlayersPerSlotForCategory(activeTournament);
   const rawRegisteredCount = Math.max(0, Number(activeTournament.registeredCount) || 0);
+  const regsDerivedCount =
+    registrationsList.length > 0 && usePlayerPerSlot
+      ? Math.min(
+          maxSlots,
+          registrationsList.reduce(
+            (sum, reg) => sum + getSlotWeightForRegistration(activeTournament, reg.players),
+            0
+          )
+        )
+      : 0;
+  const baseRegisteredCount = Math.max(rawRegisteredCount, regsDerivedCount);
   const registeredCount = optimisticJoin
-    ? Math.min(maxSlots, Math.max(rawRegisteredCount, optimisticJoin.expectedRegisteredCount))
-    : rawRegisteredCount;
+    ? Math.min(maxSlots, Math.max(baseRegisteredCount, optimisticJoin.expectedRegisteredCount))
+    : baseRegisteredCount;
   const remainingSlots = Math.max(0, maxSlots - registeredCount);
   const isFull = registeredCount >= maxSlots;
   const progressPercent = Math.min(100, Math.round((registeredCount / maxSlots) * 100));
@@ -160,10 +181,22 @@ export const MatchCard: React.FC<MatchCardProps> = ({
   const bannerSrc = bannerError ? fallbackBannerSrc : resolveTournamentBannerUrl(activeTournament);
   const matchTypeLabel = getMatchTypeBadgeLabel(matchCategory);
   const normalizedStatus = (activeTournament.status || 'REGISTRATION_OPEN').toUpperCase();
+  const isEndedOrCancelled = normalizedStatus === 'COMPLETED' || normalizedStatus === 'CANCELLED';
+
+  // Always derive live/upcoming state dynamically from the latest edited matchDate + matchTime
+  const matchTarget = parseMatchDateAndTime(activeTournament.matchDate, activeTournament.matchTime);
+  const diffSec = matchTarget ? Math.floor((matchTarget.getTime() - now.getTime()) / 1000) : null;
+  const isUpcomingByTime = diffSec !== null && diffSec > 0;
+  const isMatchLiveNow =
+    !isEndedOrCancelled &&
+    (diffSec !== null ? diffSec <= 0 : normalizedStatus === 'ONGOING');
+
   const isOpenForRegistration =
     !isFull &&
     remainingSlots > 0 &&
-    (normalizedStatus === 'REGISTRATION_OPEN' || normalizedStatus === 'OPEN');
+    !isEndedOrCancelled &&
+    (isUpcomingByTime ||
+      (diffSec === null && (normalizedStatus === 'REGISTRATION_OPEN' || normalizedStatus === 'OPEN')));
   const isFewSlotsLeft =
     isOpenForRegistration &&
     (matchCategory === 'BR MATCH'
@@ -191,8 +224,6 @@ export const MatchCard: React.FC<MatchCardProps> = ({
   const perKillPrizeValue = showPerKillPrize ? Number(activeTournament.perKillPrize ?? 0) : 0;
   const showWinningBreakdown = isPlacementPrizeCategory(matchCategory);
 
-  // Live countdown calculation ("59 Minute 19 Second" format)
-  const matchTarget = parseMatchDateAndTime(activeTournament.matchDate, activeTournament.matchTime);
   const isVerifiedAdminActor = Boolean(
     currentUser &&
       isAdmin &&
@@ -200,42 +231,53 @@ export const MatchCard: React.FC<MatchCardProps> = ({
   );
   const canEditMatchTime =
     isVerifiedAdminActor &&
-    normalizedStatus !== 'ONGOING' &&
     normalizedStatus !== 'COMPLETED' &&
-    normalizedStatus !== 'CANCELLED' &&
-    (!matchTarget || matchTarget.getTime() > now.getTime());
+    normalizedStatus !== 'CANCELLED';
+  const canEditMatchSlots =
+    isVerifiedAdminActor &&
+    isSlotEditableCategory(matchCategory) &&
+    normalizedStatus !== 'COMPLETED' &&
+    normalizedStatus !== 'CANCELLED';
 
-  let countdownPrefix = 'Starts in:';
+  let countdownPrefix = 'Status:';
   let countdownValue = 'Match Started / Live';
+  let countdownSubtext: string | null = null;
+  let isUpcomingStatus = false;
 
-  if (tournament.status === 'COMPLETED') {
+  if (normalizedStatus === 'COMPLETED') {
     countdownPrefix = 'Status:';
     countdownValue = 'Match Ended';
-  } else if (tournament.status === 'CANCELLED') {
+  } else if (normalizedStatus === 'CANCELLED') {
     countdownPrefix = 'Status:';
     countdownValue = 'Cancelled';
-  } else if (tournament.status === 'ONGOING') {
-    countdownPrefix = 'Status:';
-    countdownValue = 'Match Started / Live';
-  } else if (matchTarget) {
-    const diffSec = Math.floor((matchTarget.getTime() - now.getTime()) / 1000);
+  } else if (matchTarget && diffSec !== null) {
     if (diffSec <= 0) {
       countdownPrefix = 'Status:';
       countdownValue = 'Match Started / Live';
     } else {
+      isUpcomingStatus = true;
+      countdownPrefix = 'Status:';
+      countdownValue = isFull ? 'Upcoming / Slots Full' : 'Upcoming / Registration Open';
       const days = Math.floor(diffSec / 86400);
       const hours = Math.floor((diffSec % 86400) / 3600);
       const minutes = Math.floor((diffSec % 3600) / 60);
       const seconds = diffSec % 60;
       const pad = (n: number) => String(n).padStart(2, '0');
       if (days > 0) {
-        countdownValue = `${days}d ${hours}h ${pad(minutes)}m ${pad(seconds)}s`;
+        countdownSubtext = `${days}d ${hours}h ${pad(minutes)}m ${pad(seconds)}s`;
       } else if (hours > 0) {
-        countdownValue = `${hours} Hour ${pad(minutes)} Minute ${pad(seconds)} Second`;
+        countdownSubtext = `${hours} Hour ${pad(minutes)} Minute ${pad(seconds)} Second`;
       } else {
-        countdownValue = `${pad(minutes)} Minute ${pad(seconds)} Second`;
+        countdownSubtext = `${pad(minutes)} Minute ${pad(seconds)} Second`;
       }
     }
+  } else if (normalizedStatus === 'ONGOING') {
+    countdownPrefix = 'Status:';
+    countdownValue = 'Match Started / Live';
+  } else {
+    isUpcomingStatus = true;
+    countdownPrefix = 'Status:';
+    countdownValue = isFull ? 'Upcoming / Slots Full' : 'Upcoming / Registration Open';
   }
 
   const handleOpenSlotsModal = async (e: React.MouseEvent) => {
@@ -266,6 +308,24 @@ export const MatchCard: React.FC<MatchCardProps> = ({
         setRegistrationsList(merged);
       } else {
         setRegistrationsList(list);
+      }
+
+      if (
+        usePlayerPerSlot &&
+        list.length > 0 &&
+        normalizedStatus !== 'COMPLETED' &&
+        normalizedStatus !== 'CANCELLED'
+      ) {
+        const expected = Math.min(
+          maxSlots,
+          list.reduce(
+            (sum, reg) => sum + getSlotWeightForRegistration(activeTournament, reg.players),
+            0
+          )
+        );
+        if (expected > 0 && expected !== rawRegisteredCount) {
+          void reconcileSingleTournamentCount(tournament.id).catch(() => {});
+        }
       }
     } catch {
       if (!optimisticJoin) {
@@ -310,9 +370,10 @@ export const MatchCard: React.FC<MatchCardProps> = ({
 
   const msUntilMatch = matchTarget ? matchTarget.getTime() - now.getTime() : null;
   const isWithinReleaseWindow =
-    tournament.status === 'ONGOING' ||
-    tournament.status === 'COMPLETED' ||
-    (msUntilMatch !== null && msUntilMatch <= 4 * 60 * 1000);
+    normalizedStatus === 'COMPLETED' ||
+    (msUntilMatch !== null
+      ? msUntilMatch <= 4 * 60 * 1000
+      : normalizedStatus === 'ONGOING');
   const hasSavedRoomId = Boolean(roomData?.roomId && roomData.roomId.trim().length > 0);
   const canShowRoomCredentials =
     verifiedJoined &&
@@ -322,7 +383,7 @@ export const MatchCard: React.FC<MatchCardProps> = ({
   return (
     <>
       <div
-        onClick={() => onSelect(tournament)}
+        onClick={() => onSelect(activeTournament)}
         className="group relative bg-white dark:bg-[#0D1428] border border-slate-200 dark:border-slate-800 hover:border-amber-500/70 dark:hover:border-amber-500/50 rounded-2xl w-full h-full flex flex-col justify-between overflow-hidden shadow-md dark:shadow-xl dark:shadow-black/40 transition-all cursor-pointer select-none"
       >
         {/* TOP COMPACT BANNER PHOTO (Uniform height & full card width across all match types) */}
@@ -357,7 +418,11 @@ export const MatchCard: React.FC<MatchCardProps> = ({
               {matchTypeLabel}
             </span>
 
-            {isFewSlotsLeft ? (
+            {isMatchLiveNow ? (
+              <span className="px-2 py-0.5 rounded bg-emerald-600 text-white uppercase tracking-wider font-black shadow-md whitespace-nowrap">
+                LIVE NOW
+              </span>
+            ) : isFewSlotsLeft ? (
               <span className="px-2 py-0.5 rounded bg-orange-500 text-white uppercase tracking-wider font-black shadow-md whitespace-nowrap">
                 FEW SLOTS LEFT
               </span>
@@ -365,19 +430,19 @@ export const MatchCard: React.FC<MatchCardProps> = ({
               <span className="px-2 py-0.5 rounded bg-red-900 text-white uppercase tracking-wider font-black shadow-md whitespace-nowrap">
                 SLOTS FULL
               </span>
-            ) : tournament.status === 'ONGOING' ? (
-              <span className="px-2 py-0.5 rounded bg-emerald-600 text-white uppercase tracking-wider font-black shadow-md whitespace-nowrap">
-                LIVE NOW
-              </span>
-            ) : tournament.status === 'COMPLETED' ? (
+            ) : normalizedStatus === 'COMPLETED' ? (
               <span className="px-2 py-0.5 rounded bg-black/70 text-white uppercase tracking-wider font-black shadow-md whitespace-nowrap">
                 ENDED
               </span>
-            ) : tournament.status === 'CANCELLED' ? (
+            ) : normalizedStatus === 'CANCELLED' ? (
               <span className="px-2 py-0.5 rounded bg-red-900 text-white uppercase tracking-wider font-black shadow-md whitespace-nowrap">
                 CANCELLED
               </span>
-            ) : null}
+            ) : (
+              <span className="px-2 py-0.5 rounded bg-emerald-600/95 text-white uppercase tracking-wider font-black shadow-md whitespace-nowrap">
+                UPCOMING / OPEN
+              </span>
+            )}
           </div>
 
           {/* Bottom Banner Corners: Left = Map Name, Right = Time + Clock Icon + Admin Edit Pencil */}
@@ -476,10 +541,26 @@ export const MatchCard: React.FC<MatchCardProps> = ({
 
           {/* Compact Registration Progress Bar */}
           <div className="space-y-1 font-gaming">
-            <div className="flex justify-between text-[10px] leading-none text-slate-600 dark:text-slate-300">
+            <div className="flex justify-between items-center text-[10px] leading-none text-slate-600 dark:text-slate-300">
               <span className="font-semibold">Registration</span>
-              <span className="font-bold text-amber-600 dark:text-amber-400 tabular-nums">
-                {registeredCount}/{maxSlots}
+              <span className="inline-flex items-center gap-1 font-bold text-amber-600 dark:text-amber-400 tabular-nums">
+                <span>
+                  {registeredCount}/{maxSlots}
+                </span>
+                {canEditMatchSlots && (
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setShowEditSlotsModal(true);
+                    }}
+                    title="Edit Slots"
+                    aria-label="Edit Slots"
+                    className="p-0.5 rounded bg-amber-400/95 hover:bg-amber-300 text-black shadow-sm transition-all cursor-pointer active:scale-95"
+                  >
+                    <Pencil className="w-2.5 h-2.5 stroke-[2.5]" />
+                  </button>
+                )}
               </span>
             </div>
             <div className="w-full h-1.5 rounded-full bg-slate-200 dark:bg-slate-800 overflow-hidden">
@@ -513,7 +594,7 @@ export const MatchCard: React.FC<MatchCardProps> = ({
               >
                 Slots Full
               </button>
-            ) : tournament.status === 'COMPLETED' ? (
+            ) : activeTournament.status === 'COMPLETED' ? (
               <button
                 type="button"
                 disabled
@@ -522,7 +603,7 @@ export const MatchCard: React.FC<MatchCardProps> = ({
               >
                 Ended
               </button>
-            ) : tournament.status === 'CANCELLED' ? (
+            ) : activeTournament.status === 'CANCELLED' ? (
               <button
                 type="button"
                 disabled
@@ -536,7 +617,7 @@ export const MatchCard: React.FC<MatchCardProps> = ({
                 type="button"
                 onClick={(e) => {
                   e.stopPropagation();
-                  onJoin(tournament);
+                  onJoin(activeTournament);
                 }}
                 className="w-full h-8 rounded-lg bg-gradient-to-r from-[#CFA84B] via-[#F4D77A] to-[#CFA84B] hover:brightness-110 active:scale-[0.99] text-black font-black font-gaming text-[11px] tracking-wider uppercase shadow-sm shadow-[#CFA84B]/20 transition-all cursor-pointer flex items-center justify-center border border-[#F4D77A]/60 whitespace-nowrap"
               >
@@ -575,13 +656,26 @@ export const MatchCard: React.FC<MatchCardProps> = ({
             </div>
           </div>
 
-          {/* BOTTOM COUNTDOWN FOOTER */}
-          <div className="pt-1.5 border-t border-slate-200 dark:border-slate-800/90 flex items-center justify-center gap-1.5 text-[10px] leading-none">
-            <Clock className="w-3 h-3 text-amber-600 dark:text-[#F4D77A] shrink-0" />
-            <span className="text-slate-600 dark:text-slate-300 font-medium">{countdownPrefix}</span>
-            <span className="font-bold font-gaming text-amber-700 dark:text-[#F4D77A] truncate tabular-nums">
-              {countdownValue}
-            </span>
+          {/* BOTTOM COUNTDOWN / STATUS FOOTER */}
+          <div className="pt-1.5 border-t border-slate-200 dark:border-slate-800/90 flex flex-col items-center justify-center gap-0.5 text-[10px] leading-tight text-center">
+            <div className="flex items-center justify-center gap-1.5 min-w-0 max-w-full">
+              <Clock className="w-3 h-3 text-amber-600 dark:text-[#F4D77A] shrink-0" />
+              <span className="text-slate-600 dark:text-slate-300 font-medium shrink-0">{countdownPrefix}</span>
+              <span
+                className={`font-bold font-gaming truncate tabular-nums ${
+                  isUpcomingStatus
+                    ? 'text-emerald-600 dark:text-emerald-400'
+                    : 'text-amber-700 dark:text-[#F4D77A]'
+                }`}
+              >
+                {countdownValue}
+              </span>
+            </div>
+            {countdownSubtext && (
+              <span className="text-[9.5px] font-bold font-gaming text-amber-700 dark:text-[#F4D77A] tabular-nums">
+                Starts in: {countdownSubtext}
+              </span>
+            )}
           </div>
         </div>
       </div>
@@ -659,43 +753,74 @@ export const MatchCard: React.FC<MatchCardProps> = ({
                         Notice: Participants list is hidden for normal users. Only admins can see this roster.
                       </div>
                     )}
-                    {registrationsList.map((reg, i) => {
-                      const p1 =
-                        reg.players?.[0]?.inGameName ||
-                        reg.players?.[0]?.name ||
-                        reg.userName ||
-                        'Player 1';
-                      const p2Raw =
-                        reg.players?.[1]?.inGameName ||
-                        reg.players?.[1]?.name;
-                      const p2 = p2Raw && !p2Raw.includes('Partner: -') && !p2Raw.includes('Solo') ? p2Raw : null;
-
-                      return (
-                        <div
-                          key={reg.id || i}
-                          className="flex items-center justify-between px-3 py-2 rounded-xl bg-slate-50 dark:bg-[#070B18] border border-slate-200 dark:border-slate-800 text-xs"
-                        >
-                          <div className="flex items-center gap-2.5 min-w-0">
-                            <span className="px-2 py-0.5 rounded bg-gradient-to-r from-[#CFA84B] to-[#F4D77A] text-black font-black font-gaming text-[10px] shrink-0">
-                              #{reg.slotNumber || i + 1}
-                            </span>
-                            <div className="min-w-0">
-                              <span className="font-bold text-slate-900 dark:text-white truncate block">
-                                Player 1: {p1}
-                              </span>
-                              {p2 && (
-                                <span className="text-[10px] text-sky-600 dark:text-sky-400 font-bold truncate block">
-                                  Player 2: {p2}
+                    {usePlayerPerSlot
+                      ? buildExpandedMatchSlots(activeTournament, registrationsList, maxSlots)
+                          .filter((entry) => entry.registration !== null)
+                          .map(({ slotNumber, registration: reg, player: slotPlayer, playerLabel }, i) => {
+                            if (!reg) return null;
+                            const playerName =
+                              slotPlayer?.inGameName ||
+                              slotPlayer?.name ||
+                              reg.userName ||
+                              playerLabel;
+                            return (
+                              <div
+                                key={`${reg.id || i}-slot-${slotNumber}`}
+                                className="flex items-center justify-between px-3 py-2 rounded-xl bg-slate-50 dark:bg-[#070B18] border border-slate-200 dark:border-slate-800 text-xs"
+                              >
+                                <div className="flex items-center gap-2.5 min-w-0">
+                                  <span className="px-2 py-0.5 rounded bg-gradient-to-r from-[#CFA84B] to-[#F4D77A] text-black font-black font-gaming text-[10px] shrink-0">
+                                    #{slotNumber}
+                                  </span>
+                                  <div className="min-w-0">
+                                    <span className="font-bold text-slate-900 dark:text-white truncate block">
+                                      {playerLabel}: {playerName}
+                                    </span>
+                                  </div>
+                                </div>
+                                <span className="text-[10px] font-semibold text-emerald-600 dark:text-emerald-400 uppercase shrink-0">
+                                  Confirmed
                                 </span>
-                              )}
+                              </div>
+                            );
+                          })
+                      : registrationsList.map((reg, i) => {
+                          const p1 =
+                            reg.players?.[0]?.inGameName ||
+                            reg.players?.[0]?.name ||
+                            reg.userName ||
+                            'Player 1';
+                          const p2Raw =
+                            reg.players?.[1]?.inGameName ||
+                            reg.players?.[1]?.name;
+                          const p2 = p2Raw && !p2Raw.includes('Partner: -') && !p2Raw.includes('Solo') ? p2Raw : null;
+
+                          return (
+                            <div
+                              key={reg.id || i}
+                              className="flex items-center justify-between px-3 py-2 rounded-xl bg-slate-50 dark:bg-[#070B18] border border-slate-200 dark:border-slate-800 text-xs"
+                            >
+                              <div className="flex items-center gap-2.5 min-w-0">
+                                <span className="px-2 py-0.5 rounded bg-gradient-to-r from-[#CFA84B] to-[#F4D77A] text-black font-black font-gaming text-[10px] shrink-0">
+                                  #{reg.slotNumber || i + 1}
+                                </span>
+                                <div className="min-w-0">
+                                  <span className="font-bold text-slate-900 dark:text-white truncate block">
+                                    Player 1: {p1}
+                                  </span>
+                                  {p2 && (
+                                    <span className="text-[10px] text-sky-600 dark:text-sky-400 font-bold truncate block">
+                                      Player 2: {p2}
+                                    </span>
+                                  )}
+                                </div>
+                              </div>
+                              <span className="text-[10px] font-semibold text-emerald-600 dark:text-emerald-400 uppercase shrink-0">
+                                Confirmed
+                              </span>
                             </div>
-                          </div>
-                          <span className="text-[10px] font-semibold text-emerald-600 dark:text-emerald-400 uppercase shrink-0">
-                            Confirmed
-                          </span>
-                        </div>
-                      );
-                    })}
+                          );
+                        })}
                   </>
                 )}
               </div>
@@ -781,12 +906,12 @@ export const MatchCard: React.FC<MatchCardProps> = ({
                     </div>
 
                     <div className="flex items-center gap-2.5 pt-2">
-                      {!isFull && tournament.status === 'REGISTRATION_OPEN' && (
+                      {!isFull && isOpenForRegistration && (
                         <button
                           type="button"
                           onClick={() => {
                             setShowRoomModal(false);
-                            onJoin(tournament);
+                            onJoin(activeTournament);
                           }}
                           className="flex-1 py-2.5 px-4 rounded-xl bg-gradient-to-r from-[#CFA84B] via-[#F4D77A] to-[#CFA84B] hover:brightness-110 text-black font-black font-gaming text-xs tracking-wider uppercase transition-all cursor-pointer border border-[#F4D77A]/50"
                         >
@@ -1043,12 +1168,12 @@ export const MatchCard: React.FC<MatchCardProps> = ({
                 </div>
 
                 <div className="flex items-center gap-2.5 pt-1">
-                  {!verifiedJoined && !isFull && tournament.status === 'REGISTRATION_OPEN' && (
+                  {!verifiedJoined && !isFull && isOpenForRegistration && (
                     <button
                       type="button"
                       onClick={() => {
                         setShowPrizeModal(false);
-                        onJoin(tournament);
+                        onJoin(activeTournament);
                       }}
                       className="flex-1 py-2.5 px-4 rounded-xl bg-gradient-to-r from-[#CFA84B] via-[#F4D77A] to-[#CFA84B] hover:brightness-110 text-black font-black font-gaming text-xs tracking-wider uppercase transition-all cursor-pointer border border-[#F4D77A]/50"
                     >
@@ -1076,7 +1201,23 @@ export const MatchCard: React.FC<MatchCardProps> = ({
         onClose={() => setShowEditTimeModal(false)}
         onSuccess={(updated, message) => {
           setLocalTournament(updated);
+          setNow(new Date());
           onTimeUpdated?.(updated, message);
+        }}
+      />
+
+      {/* ADMIN ONLY: EDIT MATCH SLOTS MODAL (BR MATCH & SPECIAL MATCH ONLY) */}
+      <EditMatchSlotsModal
+        isOpen={canEditMatchSlots && showEditSlotsModal}
+        tournament={activeTournament}
+        onClose={() => setShowEditSlotsModal(false)}
+        onSuccess={(updated, message) => {
+          setLocalTournament(updated);
+          if (onSlotsUpdated) {
+            onSlotsUpdated(updated, message);
+          } else {
+            onTimeUpdated?.(updated, message);
+          }
         }}
       />
     </>

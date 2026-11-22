@@ -8,7 +8,11 @@ import {
   isJoinLockedOrJoined,
 } from '../../services/optimisticJoinStore';
 import { getWalletBreakdown } from '../../services/walletService';
-import { formatEntryTypeLabel } from '../../constants/categoryRules';
+import {
+  countsPlayersPerSlotForCategory,
+  formatEntryTypeLabel,
+  getSlotWeightForRegistration,
+} from '../../constants/categoryRules';
 import { requestBrowserNotificationPermission } from '../../services/pushNotificationService';
 import {
   X,
@@ -166,6 +170,20 @@ export const JoinTournamentModal: React.FC<JoinTournamentModalProps> = ({
           }
         );
       }
+    }
+
+    const slotWeight = getSlotWeightForRegistration(tournament, playersList);
+    const remainingSlots = Math.max(
+      0,
+      (Number(tournament.maxSlots) || 0) - (Number(tournament.registeredCount) || 0)
+    );
+    if (slotWeight > remainingSlots) {
+      setError(
+        language === 'bn'
+          ? `দুঃখিত! এই ম্যাচে মাত্র ${remainingSlots} টি স্লট খালি আছে, তাই ${slotWeight} জনের নাম দিয়ে জয়েন করা যাবে না!`
+          : `Sorry! Only ${remainingSlots} slot(s) remaining in this match, cannot join with ${slotWeight} players!`
+      );
+      return;
     }
 
     const finalUserName = isDuoSolo ? `${player1Name.trim()} (Solo)` : player1Name.trim();
@@ -382,6 +400,23 @@ export const JoinTournamentModal: React.FC<JoinTournamentModalProps> = ({
                 </div>
               </>
             )}
+
+            {/* Live Slot Booking Count Hint for Multi-Player Categories */}
+            {countsPlayersPerSlotForCategory(tournament) &&
+              (tournament.type === 'DUO' || tournament.type === 'SQUAD') && (
+                <div className="px-3 py-2 rounded-xl bg-sky-50 dark:bg-[#111D35] border border-sky-200 dark:border-sky-500/30 flex items-center justify-between text-[11px] font-semibold text-sky-800 dark:text-sky-300">
+                  <span>
+                    {language === 'bn' ? 'মোট বুকিং স্লট সংখ্যা:' : 'Slots to be booked:'}
+                  </span>
+                  <span className="font-black font-gaming text-sky-600 dark:text-sky-400">
+                    {tournament.type === 'SQUAD'
+                      ? '4 Players (4 Slots)'
+                      : player2Name.trim()
+                      ? '2 Players (2 Slots)'
+                      : '1 Player (1 Slot)'}
+                  </span>
+                </div>
+              )}
 
             {/* Big Join Now Button */}
             <div className="pt-2">

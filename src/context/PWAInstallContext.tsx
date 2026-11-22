@@ -8,15 +8,29 @@ interface BeforeInstallPromptEvent extends Event {
 interface PWAInstallContextType {
   isInstallable: boolean;
   isInstalled: boolean;
+  isStandalone: boolean;
   isModalOpen: boolean;
   openInstallModal: () => void;
   closeInstallModal: () => void;
-  triggerInstall: () => Promise<void>;
+  triggerInstall: () => Promise<'accepted' | 'dismissed' | 'fallback'>;
 }
 
 const PWAInstallContext = createContext<PWAInstallContextType | null>(null);
 
 let globalDeferredPrompt: BeforeInstallPromptEvent | null = null;
+
+function detectStandaloneDisplayMode(): boolean {
+  if (typeof window === 'undefined') return false;
+  const ua = typeof navigator !== 'undefined' ? navigator.userAgent || '' : '';
+  return (
+    window.matchMedia('(display-mode: standalone)').matches ||
+    window.matchMedia('(display-mode: fullscreen)').matches ||
+    window.matchMedia('(display-mode: minimal-ui)').matches ||
+    (window.navigator as any).standalone === true ||
+    document.referrer.includes('android-app://') ||
+    ua.includes('TXTourBDApp')
+  );
+}
 
 if (typeof window !== 'undefined') {
   window.addEventListener('beforeinstallprompt', (e) => {
@@ -34,36 +48,40 @@ export const PWAInstallProvider: React.FC<{ children: React.ReactNode }> = ({
 }) => {
   const [deferredPrompt, setDeferredPrompt] =
     useState<BeforeInstallPromptEvent | null>(globalDeferredPrompt);
+  const [isStandalone, setIsStandalone] = useState<boolean>(() =>
+    detectStandaloneDisplayMode()
+  );
   const [isInstalled, setIsInstalled] = useState<boolean>(() => {
     if (typeof window === 'undefined') return false;
-    const isStandalone =
-      window.matchMedia('(display-mode: standalone)').matches ||
-      window.matchMedia('(display-mode: fullscreen)').matches ||
-      window.matchMedia('(display-mode: minimal-ui)').matches ||
-      (window.navigator as any).standalone === true ||
-      document.referrer.includes('android-app://');
+    const standalone = detectStandaloneDisplayMode();
     const localFlag = localStorage.getItem('tx_pwa_installed') === 'true';
-    return isStandalone || localFlag;
+    return standalone || localFlag;
   });
   const [isModalOpen, setIsModalOpen] = useState(false);
 
   useEffect(() => {
     // Check if already in standalone display mode or recorded in localStorage
     const checkInstalled = () => {
-      const isStandalone =
-        window.matchMedia('(display-mode: standalone)').matches ||
-        window.matchMedia('(display-mode: fullscreen)').matches ||
-        window.matchMedia('(display-mode: minimal-ui)').matches ||
-        (window.navigator as any).standalone === true ||
-        document.referrer.includes('android-app://');
+      const standalone = detectStandaloneDisplayMode();
+      setIsStandalone(standalone);
       const localFlag = localStorage.getItem('tx_pwa_installed') === 'true';
 
-      if (isStandalone || localFlag) {
+      if (standalone || localFlag) {
         setIsInstalled(true);
       }
     };
 
     checkInstalled();
+
+    // Listen for display-mode changes (e.g., transitioning to standalone)
+    const standaloneQuery =
+      typeof window !== 'undefined' && window.matchMedia
+        ? window.matchMedia('(display-mode: standalone)')
+        : null;
+    const handleDisplayModeChange = () => checkInstalled();
+    if (standaloneQuery?.addEventListener) {
+      standaloneQuery.addEventListener('change', handleDisplayModeChange);
+    }
 
     // Check navigator.getInstalledRelatedApps if supported
     if ('getInstalledRelatedApps' in navigator) {
@@ -109,13 +127,16 @@ export const PWAInstallProvider: React.FC<{ children: React.ReactNode }> = ({
     return () => {
       window.removeEventListener('beforeinstallprompt', handleBeforeInstall);
       window.removeEventListener('appinstalled', handleAppInstalled);
+      if (standaloneQuery?.removeEventListener) {
+        standaloneQuery.removeEventListener('change', handleDisplayModeChange);
+      }
     };
   }, []);
 
   const openInstallModal = () => setIsModalOpen(true);
   const closeInstallModal = () => setIsModalOpen(false);
 
-  const triggerInstall = async () => {
+  const triggerInstall = async (): Promise<'accepted' | 'dismissed' | 'fallback'> => {
     const promptEvent =
       deferredPrompt ||
       globalDeferredPrompt ||
@@ -135,8 +156,9 @@ export const PWAInstallProvider: React.FC<{ children: React.ReactNode }> = ({
           if (typeof window !== 'undefined') {
             (window as any).__TX_DEFERRED_PROMPT__ = null;
           }
+          return 'accepted';
         }
-        return;
+        return 'dismissed';
       } catch (err) {
         console.warn('Chrome install prompt error, showing guide:', err);
       }
@@ -144,6 +166,7 @@ export const PWAInstallProvider: React.FC<{ children: React.ReactNode }> = ({
 
     // Only fallback to 3-step text popup if Chrome native popup is not available or supported
     setIsModalOpen(true);
+    return 'fallback';
   };
 
   return (
@@ -151,6 +174,7 @@ export const PWAInstallProvider: React.FC<{ children: React.ReactNode }> = ({
       value={{
         isInstallable: Boolean(deferredPrompt || globalDeferredPrompt),
         isInstalled,
+        isStandalone,
         isModalOpen,
         openInstallModal,
         closeInstallModal,

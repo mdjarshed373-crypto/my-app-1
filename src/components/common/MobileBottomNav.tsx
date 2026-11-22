@@ -45,7 +45,7 @@ export const MobileBottomNav: React.FC<MobileBottomNavProps> = ({
   return (
     <nav
       aria-label="Bottom Navigation"
-      className="keep-dark-surface fixed bottom-0 inset-x-0 z-40 bg-[#0A0A0A] border-t border-[#CFA84B]/60 shadow-[0_-4px_25px_rgba(0,0,0,0.9)] pb-safe select-none"
+      className="keep-dark-surface fixed bottom-0 inset-x-0 z-[45] bg-[#0A0A0A] border-t border-[#CFA84B]/60 shadow-[0_-4px_25px_rgba(0,0,0,0.9)] pb-safe select-none"
     >
       <div className="max-w-xl mx-auto px-2 pt-1 pb-1.5 flex items-end justify-between">
         {items.map((item) => {

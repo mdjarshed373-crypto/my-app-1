@@ -9,13 +9,14 @@ import { WelcomeNoticeModal } from './components/common/WelcomeNoticeModal';
 import { AnnouncementPopupModal } from './components/common/AnnouncementPopupModal';
 import { SplashScreen } from './components/common/SplashScreen';
 import { AuthModal } from './components/common/AuthModal';
+import { KbdAuthScreen } from './components/auth/KbdAuthScreen';
+import { PreLoginInstallScreen } from './components/auth/PreLoginInstallScreen';
 import { JoinTournamentModal } from './components/tournament/JoinTournamentModal';
 import { ToastNotification } from './components/common/ToastNotification';
 import { FullscreenBreakoutBar } from './components/common/FullscreenBreakoutBar';
-import { PWAInstallProvider } from './context/PWAInstallContext';
+import { PWAInstallProvider, usePWAInstall } from './context/PWAInstallContext';
 import { PWAInstallModal } from './components/common/PWAInstallModal';
 import { forceResetBodyScroll } from './utils/scrollLock';
-import { LandingPage } from './pages/LandingPage';
 import { InstallPage } from './pages/InstallPage';
 import { Home } from './pages/Home';
 import { TournamentsList } from './pages/TournamentsList';
@@ -133,28 +134,16 @@ function resolvePageFromLocation(): string | null {
   return parseLinkTarget()?.page || null;
 }
 
-function isStandaloneMode(): boolean {
-  if (typeof window === 'undefined') return false;
-  return (
-    window.matchMedia('(display-mode: standalone)').matches ||
-    window.matchMedia('(display-mode: fullscreen)').matches ||
-    window.matchMedia('(display-mode: minimal-ui)').matches ||
-    (window.navigator as { standalone?: boolean }).standalone === true ||
-    document.referrer.includes('android-app://')
-  );
-}
-
 function MainApp() {
   const { currentUser, userProfile, isAdmin, isSuperAdmin, loading: authLoading, banAlertMessage, clearBanAlert } = useAuth();
+  const { isStandalone } = usePWAInstall();
   const { language } = useLanguage();
+  const [continueToLogin, setContinueToLogin] = useState(false);
 
   const [currentPage, setCurrentPage] = useState<string>(() => {
     const urlPage = resolvePageFromLocation();
-    if (urlPage) {
+    if (urlPage && urlPage !== 'landing') {
       return urlPage;
-    }
-    if (isStandaloneMode()) {
-      return 'home';
     }
     if (typeof window !== 'undefined') {
       try {
@@ -164,7 +153,7 @@ function MainApp() {
         }
       } catch {}
     }
-    return 'landing';
+    return 'home';
   });
   const [selectedTournamentId, setSelectedTournamentId] = useState<string | null>(() => {
     return parseLinkTarget()?.tournamentId || null;
@@ -175,6 +164,7 @@ function MainApp() {
   const [walletTab, setWalletTab] = useState<'overview' | 'deposit' | 'withdraw'>('overview');
   const [adminInitialTab, setAdminInitialTab] = useState<string | undefined>(undefined);
   const [unauthorizedNotice, setUnauthorizedNotice] = useState<string | null>(null);
+  const [authGateError, setAuthGateError] = useState<string | null>(null);
   const [joinToastMessage, setJoinToastMessage] = useState<string | null>(null);
 
   // Join Tournament Modal state
@@ -211,16 +201,18 @@ function MainApp() {
     } catch {}
     setShowSplash(false);
     forceResetBodyScroll();
-    setCurrentPage((prev) => (prev === 'adminLogin' ? prev : prev || 'landing'));
+    setCurrentPage((prev) => (prev === 'adminLogin' ? prev : prev === 'landing' || !prev ? 'home' : prev));
   }, []);
 
   const handleLogoutToLogin = useCallback(() => {
     try {
       sessionStorage.setItem('tx_welcome_shown', 'true');
     } catch {}
+    setContinueToLogin(true);
     setShowWelcomeNotice(false);
+    setAuthModalOpen(false);
+    setAuthGateError(null);
     setCurrentPage('home');
-    setAuthModalOpen(true);
   }, []);
 
   useEffect(() => {
@@ -470,6 +462,7 @@ function MainApp() {
     });
     const unsubAuthErr = subscribeAuthBackgroundErrors((msg) => {
       setUnauthorizedNotice(msg);
+      setAuthGateError(msg);
       setAuthModalOpen(true);
     });
     const unsubAuthNotice = subscribeAuthBackgroundNotices((msg) => {
@@ -514,6 +507,82 @@ function MainApp() {
     handleNavigate('wallet', { tab: 'deposit' });
   };
 
+  if (authLoading) {
+    return (
+      <div className="w-full h-[100dvh] flex flex-col items-center justify-center bg-[#070B18] text-white">
+        {showSplash ? (
+          <SplashScreen onComplete={handleSplashComplete} />
+        ) : (
+          <div className="text-xs font-gaming tracking-widest uppercase text-slate-400">
+            Loading TX TOUR BD...
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  if (!currentUser) {
+    const showPreLoginInstall = !isStandalone && !continueToLogin && currentPage !== 'adminLogin';
+
+    return (
+      <div className="w-full h-[100dvh] flex flex-col bg-[#050914] overflow-hidden relative select-none">
+        {currentPage === 'adminLogin' ? (
+          <div className="flex-1 w-full overflow-y-auto bg-[#070B18]">
+            <AdminLoginPage
+              onSuccess={() => handleNavigate('admin')}
+              onBack={() => handleNavigate('home')}
+            />
+          </div>
+        ) : showPreLoginInstall ? (
+          <PreLoginInstallScreen
+            onContinueToLogin={() => setContinueToLogin(true)}
+            onSecretAdminEntry={() => handleNavigate('adminLogin')}
+          />
+        ) : (
+          <KbdAuthScreen
+            externalError={authGateError}
+            onClearExternalError={() => setAuthGateError(null)}
+            onLoginSuccess={() => handleNavigate('home')}
+            onSecretAdminEntry={() => handleNavigate('adminLogin')}
+          />
+        )}
+
+        <PWAInstallModal />
+
+        {showSplash && <SplashScreen onComplete={handleSplashComplete} />}
+
+        {banAlertMessage && (
+          <div className="fixed inset-0 z-[70] flex items-center justify-center p-4 bg-black/85 backdrop-blur-sm">
+            <div
+              role="alertdialog"
+              aria-modal="true"
+              className="w-full max-w-sm rounded-3xl bg-[#0D1428] border-2 border-red-500/70 p-6 text-center space-y-4 shadow-2xl shadow-red-600/25"
+            >
+              <div className="w-14 h-14 rounded-full bg-red-500/15 border-2 border-red-500/60 text-red-500 flex items-center justify-center mx-auto text-2xl font-black">
+                🚫
+              </div>
+              <div className="space-y-1.5">
+                <h2 className="text-lg font-black font-gaming uppercase text-red-400">
+                  Account Banned
+                </h2>
+                <p className="text-xs sm:text-sm font-bold text-white leading-relaxed">
+                  {banAlertMessage}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={clearBanAlert}
+                className="w-full py-3 rounded-xl bg-red-600 hover:bg-red-500 text-white font-black font-gaming text-xs uppercase tracking-wider cursor-pointer"
+              >
+                OK
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+    );
+  }
+
   return (
     <div className="w-full h-[100dvh] flex flex-col bg-[#070B18] text-[#F8FAFC] overflow-hidden relative select-none">
       {/* Standalone Fullscreen Breakout Bar (removes AI Studio top bar & chat when embedded) */}
@@ -555,24 +624,11 @@ function MainApp() {
         id="main-scroll-container"
         className={`flex-1 w-full normal-scroll-container ${currentPage === 'landing' ? 'pb-16' : 'pb-[100px]'}`}
       >
-        {currentPage === 'landing' && (
-          <LandingPage
-            onOpenApp={() => handleNavigate('home')}
-            onSelectTournament={(id) => {
-              if (id) {
-                handleNavigate('tournamentDetails', { id });
-              } else {
-                handleNavigate('tournaments');
-              }
-            }}
-          />
-        )}
-
         {currentPage === 'install' && (
           <InstallPage onNavigate={handleNavigate} />
         )}
 
-        {currentPage === 'home' && (
+        {(currentPage === 'home' || currentPage === 'landing') && (
           <Home
             onNavigate={handleNavigate}
             onJoinClick={handleJoinClick}

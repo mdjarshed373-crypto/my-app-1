@@ -11,6 +11,7 @@ import { useLanguage } from '../context/LanguageContext';
 import { useAuth } from '../context/AuthContext';
 import { MatchCard } from '../components/tournament/MatchCard';
 import { fetchTournaments, deleteTournamentInstant, fetchUserRegistrations } from '../services/tournamentService';
+import { parseMatchDateAndTime } from '../constants/categoryRules';
 import {
   OptimisticJoinEntry,
   subscribeOptimisticJoins,
@@ -188,8 +189,23 @@ export const TournamentsList: React.FC<TournamentsListProps> = ({
       // Mode
       if (selectedMode !== 'ALL' && t.gameMode !== selectedMode) return false;
 
-      // Status
-      if (selectedStatus !== 'ALL' && t.status !== selectedStatus) return false;
+      // Status (derived dynamically from edited match schedule for active matches)
+      if (selectedStatus !== 'ALL') {
+        const normalizedSt = String(t.status || 'REGISTRATION_OPEN').toUpperCase();
+        let effectiveSt: string = normalizedSt;
+        if (normalizedSt !== 'COMPLETED' && normalizedSt !== 'CANCELLED') {
+          const matchStart = parseMatchDateAndTime(t.matchDate, t.matchTime);
+          if (matchStart) {
+            if (matchStart.getTime() > Date.now()) {
+              effectiveSt =
+                t.registeredCount >= t.maxSlots ? 'REGISTRATION_FULL' : 'REGISTRATION_OPEN';
+            } else {
+              effectiveSt = 'ONGOING';
+            }
+          }
+        }
+        if (effectiveSt !== selectedStatus) return false;
+      }
 
       return true;
     })
@@ -389,6 +405,12 @@ export const TournamentsList: React.FC<TournamentsListProps> = ({
               onJoin={onJoinTournament}
               onDelete={isAdmin ? handleRequestDelete : undefined}
               onTimeUpdated={(updated, message) => {
+                setTournaments((prev) =>
+                  prev.map((item) => (item.id === updated.id ? updated : item))
+                );
+                setToastMessage(message);
+              }}
+              onSlotsUpdated={(updated, message) => {
                 setTournaments((prev) =>
                   prev.map((item) => (item.id === updated.id ? updated : item))
                 );

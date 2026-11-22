@@ -1,4 +1,5 @@
 import { Tournament, TournamentRegistration } from '../types';
+import { getSlotWeightForRegistration } from '../constants/categoryRules';
 
 export type OptimisticJoinStatus = 'PENDING' | 'CONFIRMED';
 
@@ -160,9 +161,10 @@ export function startOptimisticJoin(params: {
   }
 
   inFlightKeys.add(key);
+  const slotWeight = getSlotWeightForRegistration(tournament, registration.players);
   const expectedRegisteredCount = Math.min(
     Math.max(1, Number(tournament.maxSlots) || 1),
-    Math.max(0, Number(tournament.registeredCount) || 0) + 1
+    Math.max(0, Number(tournament.registeredCount) || 0) + slotWeight
   );
 
   entriesMap.set(key, {
@@ -212,6 +214,24 @@ export function rollbackOptimisticJoin(userId: string, tournamentId: string): vo
   const key = makeKey(userId, tournamentId);
   inFlightKeys.delete(key);
   entriesMap.delete(key);
+  emitChange();
+}
+
+export function updateOptimisticJoinRegistration(
+  userId: string,
+  tournamentId: string,
+  updatedRegistration: TournamentRegistration
+): void {
+  const key = makeKey(userId, tournamentId);
+  const existing = entriesMap.get(key);
+  if (!existing) return;
+  entriesMap.set(key, {
+    ...existing,
+    registration: {
+      ...existing.registration,
+      ...updatedRegistration,
+    },
+  });
   emitChange();
 }
 

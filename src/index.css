@@ -509,3 +509,18 @@ html.light .support-floating-label {
   color: #0f172a !important;
   text-shadow: 0 1px 3px rgba(255, 255, 255, 0.95) !important;
 }
+
+/* Ensure no external hosting badge (e.g. Powered by Netlify) overlaps Bottom Navigation */
+[id*="netlify" i],
+[class*="netlify" i],
+iframe[src*="netlify" i],
+iframe[title*="netlify" i],
+a[href*="netlify.com"],
+[data-netlify-deploy-id] {
+  display: none !important;
+  visibility: hidden !important;
+  opacity: 0 !important;
+  pointer-events: none !important;
+  width: 0 !important;
+  height: 0 !important;
+}

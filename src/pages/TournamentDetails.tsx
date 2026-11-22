@@ -10,20 +10,26 @@ import {
   fetchRoomCredentials,
   deleteTournamentInstant,
   updateTournament,
+  reconcileSingleTournamentCount,
 } from '../services/tournamentService';
 import {
   OptimisticJoinEntry,
   subscribeOptimisticJoins,
+  updateOptimisticJoinRegistration,
 } from '../services/optimisticJoinStore';
 import { emitOptimisticTournamentSuccess } from '../services/optimisticTournamentStore';
 import { DeleteTournamentModal } from '../components/tournament/DeleteTournamentModal';
 import { EditMatchTimeModal } from '../components/tournament/EditMatchTimeModal';
+import { EditSlotPlayerNameModal } from '../components/tournament/EditSlotPlayerNameModal';
 import { ToastNotification } from '../components/common/ToastNotification';
 import { CategoryRulesSection } from '../components/tournament/CategoryRulesSection';
 import { UserAvatar } from '../components/common/UserAvatar';
 import { isUserAdminAccount } from '../utils/adminAuth';
 import {
+  buildExpandedMatchSlots,
+  countsPlayersPerSlotForCategory,
   getTournamentCategory,
+  getSlotWeightForRegistration,
   formatGameModeLabel,
   formatEntryTypeLabel,
   getMatchBannerUrl,
@@ -80,6 +86,10 @@ export const TournamentDetails: React.FC<TournamentDetailsProps> = ({
   const [copiedPass, setCopiedPass] = useState(false);
   const [showDeleteModal, setShowDeleteModal] = useState(false);
   const [showEditTimeModal, setShowEditTimeModal] = useState(false);
+  const [editingSlotTarget, setEditingSlotTarget] = useState<{
+    registration: TournamentRegistration;
+    playerIndex: number;
+  } | null>(null);
   const [isDeleting, setIsDeleting] = useState(false);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<'matches' | 'participants' | 'rules'>('matches');
@@ -229,6 +239,35 @@ export const TournamentDetails: React.FC<TournamentDetailsProps> = ({
     );
   }, [serverRegistrations, optimisticJoin, currentUser?.uid]);
 
+  useEffect(() => {
+    if (loading || !tournament || optimisticJoin) return;
+    if (!countsPlayersPerSlotForCategory(tournament)) return;
+    if (tournament.status === 'COMPLETED' || tournament.status === 'CANCELLED') return;
+    if (serverRegistrations.length === 0) return;
+
+    const maxSlotsVal = Math.max(1, Number(tournament.maxSlots) || 1);
+    const computedCount = Math.min(
+      maxSlotsVal,
+      serverRegistrations.reduce(
+        (sum, reg) => sum + getSlotWeightForRegistration(tournament, reg.players),
+        0
+      )
+    );
+    if (computedCount > 0 && Number(tournament.registeredCount || 0) !== computedCount) {
+      void reconcileSingleTournamentCount(tournament.id).catch(() => {});
+    }
+  }, [
+    loading,
+    tournament?.id,
+    tournament?.registeredCount,
+    tournament?.maxSlots,
+    tournament?.status,
+    tournament?.category,
+    tournament?.gameMode,
+    serverRegistrations,
+    optimisticJoin,
+  ]);
+
   if (loading) {
     return (
       <div className="min-h-screen bg-slate-100 dark:bg-[#070B18] flex items-center justify-center p-8 transition-colors">
@@ -262,49 +301,36 @@ export const TournamentDetails: React.FC<TournamentDetailsProps> = ({
   );
 
   const totalSlots = Math.max(1, Number(tournament.maxSlots) || 12);
+  const usePlayerPerSlot = countsPlayersPerSlotForCategory(tournament);
+  const countFromRegs = usePlayerPerSlot
+    ? registrations.reduce(
+        (sum, reg) => sum + getSlotWeightForRegistration(tournament, reg.players),
+        0
+      )
+    : registrations.length;
   const displayRegisteredCount = Math.min(
     totalSlots,
     Math.max(
       Number(tournament.registeredCount || 0),
-      registrations.length,
+      countFromRegs,
       optimisticJoin ? optimisticJoin.expectedRegisteredCount : 0
     )
   );
+  const normalizedStatus = String(tournament.status || 'REGISTRATION_OPEN').toUpperCase();
+  const isEndedOrCancelled = normalizedStatus === 'COMPLETED' || normalizedStatus === 'CANCELLED';
+  const matchTarget = parseMatchDateAndTime(tournament.matchDate, tournament.matchTime);
+  const diffSec = matchTarget ? Math.floor((matchTarget.getTime() - now.getTime()) / 1000) : null;
+  const isUpcomingByTime = diffSec !== null && diffSec > 0;
   const isFull = displayRegisteredCount >= totalSlots;
   const isAvailable =
-    tournament.status === 'REGISTRATION_OPEN' && !isFull && !isUserRegistered;
+    !isEndedOrCancelled &&
+    !isFull &&
+    !isUserRegistered &&
+    (isUpcomingByTime ||
+      (diffSec === null && (normalizedStatus === 'REGISTRATION_OPEN' || normalizedStatus === 'OPEN')));
 
-  // Build dynamic slots from #1 up to totalSlots (e.g. 12 slots, 24 slots, etc.)
-  const slotMap = new Map<number, TournamentRegistration>();
-  const unslottedRegistrations: TournamentRegistration[] = [];
-
-  registrations.forEach((reg) => {
-    const sn = Number(reg.slotNumber);
-    if (sn >= 1 && sn <= totalSlots && !slotMap.has(sn)) {
-      slotMap.set(sn, reg);
-    } else {
-      unslottedRegistrations.push(reg);
-    }
-  });
-
-  let nextAvailableSlot = 1;
-  unslottedRegistrations.forEach((reg) => {
-    while (nextAvailableSlot <= totalSlots && slotMap.has(nextAvailableSlot)) {
-      nextAvailableSlot++;
-    }
-    if (nextAvailableSlot <= totalSlots) {
-      slotMap.set(nextAvailableSlot, reg);
-      nextAvailableSlot++;
-    }
-  });
-
-  const allSlots = Array.from({ length: totalSlots }, (_, idx) => {
-    const slotNum = idx + 1;
-    return {
-      slotNumber: slotNum,
-      registration: slotMap.get(slotNum) || null,
-    };
-  });
+  // Build dynamic slots from #1 up to totalSlots (expanded per player for eligible categories)
+  const allSlots = buildExpandedMatchSlots(tournament, registrations, totalSlots);
 
   const matchCategory = getTournamentCategory(tournament);
   const resolvedBannerSrc = bannerError
@@ -320,9 +346,7 @@ export const TournamentDetails: React.FC<TournamentDetailsProps> = ({
     second: '2-digit',
   });
 
-  // Timer 2: Tournament Countdown (decreases towards 00:00:00, then shows Match Started / Live)
-  const matchTarget = parseMatchDateAndTime(tournament.matchDate, tournament.matchTime);
-  const normalizedStatus = String(tournament.status || '').toUpperCase();
+  // Timer 2: Tournament Countdown (always computed from latest edited matchDate + matchTime)
   const isVerifiedAdminActor = Boolean(
     currentUser &&
       isAdmin &&
@@ -330,24 +354,24 @@ export const TournamentDetails: React.FC<TournamentDetailsProps> = ({
   );
   const canEditMatchTime =
     isVerifiedAdminActor &&
-    normalizedStatus !== 'ONGOING' &&
     normalizedStatus !== 'COMPLETED' &&
-    normalizedStatus !== 'CANCELLED' &&
-    (!matchTarget || matchTarget.getTime() > now.getTime());
+    normalizedStatus !== 'CANCELLED';
 
-  let isLive = tournament.status === 'ONGOING';
+  let isLive = !isEndedOrCancelled && diffSec === null && normalizedStatus === 'ONGOING';
   let countdownText = 'Match Started / Live';
 
-  if (tournament.status === 'COMPLETED') {
+  if (normalizedStatus === 'COMPLETED') {
+    isLive = false;
     countdownText = 'ENDED';
-  } else if (tournament.status === 'CANCELLED') {
+  } else if (normalizedStatus === 'CANCELLED') {
+    isLive = false;
     countdownText = 'CANCELLED';
-  } else if (matchTarget) {
-    const diffSec = Math.floor((matchTarget.getTime() - now.getTime()) / 1000);
+  } else if (matchTarget && diffSec !== null) {
     if (diffSec <= 0) {
       isLive = true;
       countdownText = 'Match Started / Live';
     } else {
+      isLive = false;
       const hours = Math.floor(diffSec / 3600);
       const minutes = Math.floor((diffSec % 3600) / 60);
       const seconds = diffSec % 60;
@@ -643,6 +667,63 @@ export const TournamentDetails: React.FC<TournamentDetailsProps> = ({
                     </button>
                   )}
                 </div>
+              ) : usePlayerPerSlot ? (
+                allSlots
+                  .filter((entry) => entry.registration !== null)
+                  .map(({ slotNumber, registration: reg, player: slotPlayer, playerIndex, playerLabel }, idx) => {
+                    if (!reg) return null;
+                    const pName =
+                      slotPlayer?.inGameName ||
+                      slotPlayer?.name ||
+                      reg.userName ||
+                      playerLabel;
+                    const canEditThisReg = Boolean(
+                      currentUser?.uid &&
+                        reg.userId === currentUser.uid &&
+                        !isLive &&
+                        !isEndedOrCancelled
+                    );
+
+                    return (
+                      <div
+                        key={`${reg.id || idx}-slot-${slotNumber}-p-${playerIndex}`}
+                        className="p-3.5 sm:p-4 rounded-2xl bg-white dark:bg-[#0D1428] border border-slate-200 dark:border-slate-800 hover:border-sky-400 dark:hover:border-sky-500/40 transition-all flex items-center justify-between gap-3 text-xs shadow-sm"
+                      >
+                        <div className="flex items-center gap-3 min-w-0">
+                          <div className="w-8 h-8 sm:w-9 sm:h-9 rounded-full bg-slate-100 dark:bg-[#111D35] border border-slate-200 dark:border-slate-700 text-slate-900 dark:text-white font-black font-gaming text-xs flex items-center justify-center shrink-0">
+                            #{slotNumber}
+                          </div>
+
+                          <div className="min-w-0">
+                            <div className="flex items-center gap-1.5 min-w-0">
+                              <span className="font-black font-gaming text-slate-900 dark:text-white text-sm sm:text-base tracking-wide truncate">
+                                {playerLabel}: {pName}
+                              </span>
+                              {canEditThisReg && (
+                                <button
+                                  type="button"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    setEditingSlotTarget({ registration: reg, playerIndex });
+                                  }}
+                                  title="Edit Player Name"
+                                  aria-label="Edit Player Name"
+                                  className="p-1 rounded-md bg-amber-400/95 hover:bg-amber-300 text-black shadow-sm transition-all cursor-pointer active:scale-95 shrink-0"
+                                >
+                                  <Pencil className="w-2.5 h-2.5 stroke-[2.5]" />
+                                </button>
+                              )}
+                            </div>
+                          </div>
+                        </div>
+
+                        <span className="px-2.5 py-1 rounded-lg text-[10px] font-bold bg-emerald-50 dark:bg-emerald-500/15 text-emerald-700 dark:text-emerald-400 border border-emerald-200 dark:border-emerald-500/30 flex items-center gap-1 shrink-0">
+                          <Check className="w-3 h-3" />
+                          Confirmed
+                        </span>
+                      </div>
+                    );
+                  })
               ) : (
                 registrations.map((reg, idx) => {
                   const p1 =
@@ -655,6 +736,12 @@ export const TournamentDetails: React.FC<TournamentDetailsProps> = ({
                     reg.players?.[1]?.name;
                   const p2 = p2Raw && !p2Raw.includes('Partner: -') && !p2Raw.includes('Solo') ? p2Raw : null;
                   const slotNum = reg.slotNumber || idx + 1;
+                  const canEditThisReg = Boolean(
+                    currentUser?.uid &&
+                      reg.userId === currentUser.uid &&
+                      !isLive &&
+                      !isEndedOrCancelled
+                  );
 
                   return (
                     <div
@@ -667,9 +754,25 @@ export const TournamentDetails: React.FC<TournamentDetailsProps> = ({
                         </div>
 
                         <div className="min-w-0">
-                          <span className="font-black font-gaming text-slate-900 dark:text-white text-sm sm:text-base tracking-wide block truncate">
-                            Player 1: {p1}
-                          </span>
+                          <div className="flex items-center gap-1.5 min-w-0">
+                            <span className="font-black font-gaming text-slate-900 dark:text-white text-sm sm:text-base tracking-wide truncate">
+                              Player 1: {p1}
+                            </span>
+                            {canEditThisReg && (
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setEditingSlotTarget({ registration: reg, playerIndex: 0 });
+                                }}
+                                title="Edit Player Name"
+                                aria-label="Edit Player Name"
+                                className="p-1 rounded-md bg-amber-400/95 hover:bg-amber-300 text-black shadow-sm transition-all cursor-pointer active:scale-95 shrink-0"
+                              >
+                                <Pencil className="w-2.5 h-2.5 stroke-[2.5]" />
+                              </button>
+                            )}
+                          </div>
                           {p2 && (
                             <span className="text-xs text-sky-600 dark:text-sky-400 font-bold truncate block mt-0.5">
                               Player 2: {p2}
@@ -765,13 +868,19 @@ export const TournamentDetails: React.FC<TournamentDetailsProps> = ({
                     Match Started / Live
                   </span>
                 ) : (
-                  <div className="flex items-center gap-2">
-                    <span className="text-[11px] text-slate-500 dark:text-slate-400 uppercase tracking-wider font-semibold font-sans">
-                      COUNTDOWN:
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="text-[11px] text-emerald-700 dark:text-emerald-400 uppercase tracking-wider font-bold font-sans">
+                      {normalizedStatus === 'COMPLETED' || normalizedStatus === 'CANCELLED'
+                        ? normalizedStatus
+                        : isFull
+                        ? 'Upcoming / Slots Full'
+                        : 'Upcoming / Registration Open'}
                     </span>
-                    <span className="bg-amber-50 dark:bg-[#090E1F] px-3 py-1 rounded-lg border border-amber-300 dark:border-amber-500/40 text-amber-800 dark:text-amber-300 font-bold font-gaming text-xs tracking-wider tabular-nums">
-                      Tournament starts in: {countdownText}
-                    </span>
+                    {!isEndedOrCancelled && (
+                      <span className="bg-amber-50 dark:bg-[#090E1F] px-3 py-1 rounded-lg border border-amber-300 dark:border-amber-500/40 text-amber-800 dark:text-amber-300 font-bold font-gaming text-xs tracking-wider tabular-nums">
+                        Starts in: {countdownText}
+                      </span>
+                    )}
                   </div>
                 )}
               </div>
@@ -980,7 +1089,7 @@ export const TournamentDetails: React.FC<TournamentDetailsProps> = ({
                         Notice: Participants list is hidden for normal users. Only admins can see this roster.
                       </div>
                     )}
-                    {allSlots.map(({ slotNumber, registration: reg }) => {
+                    {allSlots.map(({ slotNumber, registration: reg, player: slotPlayer, playerIndex, playerLabel }) => {
                       if (!reg) {
                         return (
                           <div
@@ -1018,6 +1127,91 @@ export const TournamentDetails: React.FC<TournamentDetailsProps> = ({
                         );
                       }
 
+                      const canEditThisReg = Boolean(
+                        currentUser?.uid &&
+                          reg.userId === currentUser.uid &&
+                          !isLive &&
+                          !isEndedOrCancelled
+                      );
+
+                      if (usePlayerPerSlot) {
+                        const slotPlayerName =
+                          slotPlayer?.inGameName ||
+                          slotPlayer?.name ||
+                          reg.userName ||
+                          playerLabel;
+                        const slotPlayerUid = slotPlayer?.freeFireUid;
+                        const showUid = Boolean(
+                          slotPlayerUid &&
+                            slotPlayerUid !== '-' &&
+                            (playerIndex === 0 || !slotPlayerUid.startsWith('FF_'))
+                        );
+
+                        return (
+                          <div
+                            key={`slot-${slotNumber}`}
+                            className="p-3.5 rounded-xl bg-slate-50 dark:bg-[#111D35] border border-sky-200 dark:border-sky-500/30 hover:border-sky-400 dark:hover:border-sky-400/50 transition-all text-xs space-y-2"
+                          >
+                            <div className="flex items-center justify-between gap-2">
+                              <div className="flex items-center gap-2.5 min-w-0">
+                                <span className="w-8 h-8 rounded-lg bg-sky-50 dark:bg-sky-950 text-sky-700 dark:text-sky-400 font-bold font-gaming tabular-nums flex items-center justify-center border border-sky-200 dark:border-sky-500/40 text-xs shrink-0">
+                                  #{slotNumber}
+                                </span>
+                                <UserAvatar
+                                  user={
+                                    userProfile && reg.userId === userProfile.uid && playerIndex === 0
+                                      ? userProfile
+                                      : {
+                                          uid: reg.userId,
+                                          displayName: slotPlayerName,
+                                          inGameName: slotPlayerName,
+                                        }
+                                  }
+                                  size="sm"
+                                />
+                                <div className="min-w-0">
+                                  <div className="flex items-center gap-1.5 min-w-0">
+                                    <span className="font-bold text-slate-900 dark:text-white text-sm truncate">
+                                      {playerIndex === 0 ? '👑 ' : ''}
+                                      {playerLabel}: {slotPlayerName}
+                                    </span>
+                                    {canEditThisReg && (
+                                      <button
+                                        type="button"
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          setEditingSlotTarget({ registration: reg, playerIndex });
+                                        }}
+                                        title={`Edit ${playerLabel} Name`}
+                                        aria-label={`Edit ${playerLabel} Name`}
+                                        className="p-1 rounded-md bg-amber-400/95 hover:bg-amber-300 text-black shadow-sm transition-all cursor-pointer active:scale-95 shrink-0"
+                                      >
+                                        <Pencil className="w-2.5 h-2.5 stroke-[2.5]" />
+                                      </button>
+                                    )}
+                                  </div>
+                                  <div className="flex flex-wrap items-center gap-2 mt-0.5">
+                                    {showUid && (
+                                      <span className="text-[10px] text-slate-500 dark:text-slate-400 font-mono">
+                                        UID: {slotPlayerUid}
+                                      </span>
+                                    )}
+                                    <span className="text-[10px] text-sky-600 dark:text-sky-400 font-mono">
+                                      Slot #{slotNumber}
+                                    </span>
+                                  </div>
+                                </div>
+                              </div>
+
+                              <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-emerald-50 dark:bg-emerald-500/20 text-emerald-700 dark:text-emerald-400 border border-emerald-200 dark:border-emerald-500/30 flex items-center gap-1 shrink-0">
+                                <Check className="w-3 h-3" />
+                                Confirmed
+                              </span>
+                            </div>
+                          </div>
+                        );
+                      }
+
                       const p1 =
                         reg.players?.[0]?.inGameName ||
                         reg.players?.[0]?.name ||
@@ -1027,6 +1221,7 @@ export const TournamentDetails: React.FC<TournamentDetailsProps> = ({
                         reg.players?.[1]?.inGameName ||
                         reg.players?.[1]?.name;
                       const p2 = p2Raw && !p2Raw.includes('Partner: -') && !p2Raw.includes('Solo') ? p2Raw : null;
+                      const extraSquadPlayers = (reg.players || []).slice(2);
 
                       return (
                         <div
@@ -1070,37 +1265,113 @@ export const TournamentDetails: React.FC<TournamentDetailsProps> = ({
 
                           {/* Joined Players list */}
                           <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 pt-1.5 border-t border-slate-200 dark:border-slate-800/80">
-                            <div className="p-2 rounded-lg bg-white dark:bg-[#090E1F] border border-slate-200 dark:border-slate-800 text-[11px] flex items-center justify-between">
-                              <div>
-                                <span className="font-bold text-slate-800 dark:text-slate-200 block">
-                                  👑 Player 1: {p1}
-                                </span>
+                            <div className="p-2 rounded-lg bg-white dark:bg-[#090E1F] border border-slate-200 dark:border-slate-800 text-[11px] flex items-center justify-between gap-2">
+                              <div className="min-w-0">
+                                <div className="flex items-center gap-1.5 min-w-0">
+                                  <span className="font-bold text-slate-800 dark:text-slate-200 truncate">
+                                    👑 Player 1: {p1}
+                                  </span>
+                                  {canEditThisReg && (
+                                    <button
+                                      type="button"
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        setEditingSlotTarget({ registration: reg, playerIndex: 0 });
+                                      }}
+                                      title="Edit Player Name"
+                                      aria-label="Edit Player Name"
+                                      className="p-1 rounded-md bg-amber-400/95 hover:bg-amber-300 text-black shadow-sm transition-all cursor-pointer active:scale-95 shrink-0"
+                                    >
+                                      <Pencil className="w-2.5 h-2.5 stroke-[2.5]" />
+                                    </button>
+                                  )}
+                                </div>
                                 {reg.players?.[0]?.freeFireUid && reg.players[0].freeFireUid !== '-' && (
-                                  <span className="text-[10px] text-slate-500 dark:text-slate-400 font-mono">
+                                  <span className="text-[10px] text-slate-500 dark:text-slate-400 font-mono block">
                                     UID: {reg.players[0].freeFireUid}
                                   </span>
                                 )}
                               </div>
-                              <span className="text-[10px] text-sky-600 dark:text-sky-400 font-mono">Slot #{slotNumber}</span>
+                              <span className="text-[10px] text-sky-600 dark:text-sky-400 font-mono shrink-0">Slot #{slotNumber}</span>
                             </div>
 
                             {p2 && (
-                              <div className="p-2 rounded-lg bg-white dark:bg-[#090E1F] border border-slate-200 dark:border-slate-800 text-[11px] flex items-center justify-between">
-                                <div>
-                                  <span className="font-bold text-slate-800 dark:text-slate-200 block">
-                                    Player 2: {p2}
-                                  </span>
+                              <div className="p-2 rounded-lg bg-white dark:bg-[#090E1F] border border-slate-200 dark:border-slate-800 text-[11px] flex items-center justify-between gap-2">
+                                <div className="min-w-0">
+                                  <div className="flex items-center gap-1.5 min-w-0">
+                                    <span className="font-bold text-slate-800 dark:text-slate-200 truncate">
+                                      Player 2: {p2}
+                                    </span>
+                                    {canEditThisReg && (
+                                      <button
+                                        type="button"
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          setEditingSlotTarget({ registration: reg, playerIndex: 1 });
+                                        }}
+                                        title="Edit Player 2 Name"
+                                        aria-label="Edit Player 2 Name"
+                                        className="p-1 rounded-md bg-amber-400/95 hover:bg-amber-300 text-black shadow-sm transition-all cursor-pointer active:scale-95 shrink-0"
+                                      >
+                                        <Pencil className="w-2.5 h-2.5 stroke-[2.5]" />
+                                      </button>
+                                    )}
+                                  </div>
                                   {reg.players?.[1]?.freeFireUid &&
                                     reg.players[1].freeFireUid !== '-' &&
                                     !reg.players[1].freeFireUid.startsWith('FF_') && (
-                                      <span className="text-[10px] text-slate-500 dark:text-slate-400 font-mono">
+                                      <span className="text-[10px] text-slate-500 dark:text-slate-400 font-mono block">
                                         UID: {reg.players[1].freeFireUid}
                                       </span>
                                     )}
                                 </div>
-                                <span className="text-[10px] text-sky-600 dark:text-sky-400 font-mono">Partner</span>
+                                <span className="text-[10px] text-sky-600 dark:text-sky-400 font-mono shrink-0">Partner</span>
                               </div>
                             )}
+
+                            {extraSquadPlayers.map((extraP, extraOffset) => {
+                              const playerIdx = extraOffset + 2;
+                              const extraName = extraP.inGameName || extraP.name;
+                              if (!extraName) return null;
+                              return (
+                                <div
+                                  key={`extra-player-${playerIdx}`}
+                                  className="p-2 rounded-lg bg-white dark:bg-[#090E1F] border border-slate-200 dark:border-slate-800 text-[11px] flex items-center justify-between gap-2"
+                                >
+                                  <div className="min-w-0">
+                                    <div className="flex items-center gap-1.5 min-w-0">
+                                      <span className="font-bold text-slate-800 dark:text-slate-200 truncate">
+                                        Player {playerIdx + 1}: {extraName}
+                                      </span>
+                                      {canEditThisReg && (
+                                        <button
+                                          type="button"
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            setEditingSlotTarget({ registration: reg, playerIndex: playerIdx });
+                                          }}
+                                          title={`Edit Player ${playerIdx + 1} Name`}
+                                          aria-label={`Edit Player ${playerIdx + 1} Name`}
+                                          className="p-1 rounded-md bg-amber-400/95 hover:bg-amber-300 text-black shadow-sm transition-all cursor-pointer active:scale-95 shrink-0"
+                                        >
+                                          <Pencil className="w-2.5 h-2.5 stroke-[2.5]" />
+                                        </button>
+                                      )}
+                                    </div>
+                                    {extraP.freeFireUid &&
+                                      extraP.freeFireUid !== '-' &&
+                                      !extraP.freeFireUid.startsWith('FF_') && (
+                                        <span className="text-[10px] text-slate-500 dark:text-slate-400 font-mono block">
+                                          UID: {extraP.freeFireUid}
+                                        </span>
+                                      )}
+                                  </div>
+                                  <span className="text-[10px] text-sky-600 dark:text-sky-400 font-mono shrink-0">
+                                    Squad
+                                  </span>
+                                </div>
+                              );
+                            })}
                           </div>
                         </div>
                       );
@@ -1233,6 +1504,26 @@ export const TournamentDetails: React.FC<TournamentDetailsProps> = ({
         onClose={() => setShowEditTimeModal(false)}
         onSuccess={(updated, message) => {
           setTournament(updated);
+          setNow(new Date());
+          setToastMessage(message);
+        }}
+      />
+
+      {/* Slot Owner Only: Edit Player Name Modal (Before Match Starts) */}
+      <EditSlotPlayerNameModal
+        isOpen={Boolean(editingSlotTarget) && !isLive && !isEndedOrCancelled}
+        tournament={tournament}
+        registration={editingSlotTarget?.registration || null}
+        actorUserId={currentUser?.uid}
+        playerIndex={editingSlotTarget?.playerIndex ?? 0}
+        onClose={() => setEditingSlotTarget(null)}
+        onSuccess={(updatedReg, message) => {
+          setServerRegistrations((prev) =>
+            prev.map((item) => (item.id === updatedReg.id ? updatedReg : item))
+          );
+          if (currentUser?.uid) {
+            updateOptimisticJoinRegistration(currentUser.uid, tournament.id, updatedReg);
+          }
           setToastMessage(message);
         }}
       />

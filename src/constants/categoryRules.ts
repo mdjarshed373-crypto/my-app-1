@@ -1,4 +1,4 @@
-import { MatchCategory, Tournament } from '../types';
+import { MatchCategory, PlayerSlotInfo, Tournament, TournamentRegistration } from '../types';
 
 export interface CategoryRuleSet {
   category: MatchCategory;
@@ -196,6 +196,17 @@ export function isPlacementPrizeCategory(rawCategory?: string): boolean {
 export function supportsPerKillPrize(rawCategory?: string): boolean {
   const cat = normalizeCategory(rawCategory);
   return cat === 'BR MATCH' || cat === 'FREE MATCH';
+}
+
+export function isSlotEditableCategory(_rawCategory?: string): boolean {
+  return true;
+}
+
+export function getMaxSlotLimitForCategory(rawCategory?: string): number | null {
+  const cat = normalizeCategory(rawCategory);
+  if (cat === 'BR MATCH') return 48;
+  if (cat === 'FREE MATCH') return 1000;
+  return null;
 }
 
 export function formatGameModeLabel(gameMode?: string): string {
@@ -867,9 +878,52 @@ export function format24HourToDisplayTime(hours24: number, minutes: number): str
   return `${h12}:${String(mNorm).padStart(2, '0')} ${period}`;
 }
 
+export function getDhakaTodayDateStr(): string {
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Dhaka',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(new Date());
+}
+
+export function getDhakaDateTimeParts(date: Date): {
+  dateStr: string;
+  hours: number;
+  minutes: number;
+} {
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Asia/Dhaka',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }).formatToParts(date);
+
+  const lookup: Record<string, string> = {};
+  parts.forEach((p) => {
+    lookup[p.type] = p.value;
+  });
+
+  const y = lookup.year || '2026';
+  const m = lookup.month || '01';
+  const d = lookup.day || '01';
+  const rawHour = parseInt(lookup.hour || '0', 10);
+  const hh = Number.isFinite(rawHour) ? rawHour % 24 : 0;
+  const rawMin = parseInt(lookup.minute || '0', 10);
+  const mm = Number.isFinite(rawMin) ? rawMin : 0;
+
+  return {
+    dateStr: `${y}-${m}-${d}`,
+    hours: hh,
+    minutes: mm,
+  };
+}
+
 export function parseMatchDateAndTime(dateStr?: string, timeStr?: string): Date | null {
-  const rawDate = (dateStr || '').trim();
-  if (!rawDate) return null;
+  const rawDate = (dateStr || '').trim() || getDhakaTodayDateStr();
 
   let year: number;
   let month: number;
@@ -889,7 +943,12 @@ export function parseMatchDateAndTime(dateStr?: string, timeStr?: string): Date 
   }
 
   const { hours, minutes } = parseTimeTo24Hour(timeStr);
-  return new Date(year, month, day, hours, minutes, 0, 0);
+  const yStr = String(year).padStart(4, '0');
+  const mStr = String(month + 1).padStart(2, '0');
+  const dStr = String(day).padStart(2, '0');
+  const hStr = String(hours).padStart(2, '0');
+  const minStr = String(minutes).padStart(2, '0');
+  return new Date(`${yStr}-${mStr}-${dStr}T${hStr}:${minStr}:00+06:00`);
 }
 
 export function addMinutesToSchedule(
@@ -897,27 +956,16 @@ export function addMinutesToSchedule(
   matchTime: string | undefined,
   deltaMinutes: number
 ): { matchDate: string; matchTime: string; timeInputValue: string } {
-  const todayStr = new Intl.DateTimeFormat('en-CA', {
-    timeZone: 'Asia/Dhaka',
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-  }).format(new Date());
-
+  const todayStr = getDhakaTodayDateStr();
   const baseDateStr = (matchDate || '').trim() || todayStr;
   const baseDate = parseMatchDateAndTime(baseDateStr, matchTime) || new Date();
   const next = new Date(baseDate.getTime() + deltaMinutes * 60 * 1000);
-
-  const nextY = next.getFullYear();
-  const nextM = String(next.getMonth() + 1).padStart(2, '0');
-  const nextD = String(next.getDate()).padStart(2, '0');
-  const nextHours = next.getHours();
-  const nextMinutes = next.getMinutes();
+  const dhakaParts = getDhakaDateTimeParts(next);
 
   return {
-    matchDate: `${nextY}-${nextM}-${nextD}`,
-    matchTime: format24HourToDisplayTime(nextHours, nextMinutes),
-    timeInputValue: format24HourToInputValue(nextHours, nextMinutes),
+    matchDate: dhakaParts.dateStr,
+    matchTime: format24HourToDisplayTime(dhakaParts.hours, dhakaParts.minutes),
+    timeInputValue: format24HourToInputValue(dhakaParts.hours, dhakaParts.minutes),
   };
 }
 
@@ -925,13 +973,7 @@ export function applyTimeInputToSchedule(
   matchDate: string | undefined,
   hhmmValue: string
 ): { matchDate: string; matchTime: string } {
-  const todayStr = new Intl.DateTimeFormat('en-CA', {
-    timeZone: 'Asia/Dhaka',
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-  }).format(new Date());
-
+  const todayStr = getDhakaTodayDateStr();
   const parts = (hhmmValue || '').trim().match(/^(\d{1,2}):(\d{2})$/);
   const hours24 = parts ? Math.max(0, Math.min(23, parseInt(parts[1], 10))) : 20;
   const minutes = parts ? Math.max(0, Math.min(59, parseInt(parts[2], 10))) : 0;
@@ -941,5 +983,189 @@ export function applyTimeInputToSchedule(
     matchTime: format24HourToDisplayTime(hours24, minutes),
   };
 }
+
+/**
+ * Lost To Win and Special Match (FREE MATCH) count 1 registration = 1 slot.
+ * All other matches (BR MATCH, LONE WOLF, LONE WOLF HEADSHOT, CS 1V1/2V2, CS 4V4, etc.)
+ * count slots dynamically by how many player names were entered when joining.
+ */
+export function countsPlayersPerSlotForCategory(
+  tournamentOrCategory?: Pick<Tournament, 'category' | 'gameMode' | 'title' | 'entryFee'> | string | null
+): boolean {
+  if (!tournamentOrCategory) return true;
+  const cat =
+    typeof tournamentOrCategory === 'string'
+      ? normalizeCategory(tournamentOrCategory)
+      : getTournamentCategory(tournamentOrCategory as Tournament);
+  return cat !== 'LOST TO WIN' && cat !== 'LOSS TO WIN' && cat !== 'FREE MATCH';
+}
+
+export function isPlaceholderSlotPlayer(player?: Partial<PlayerSlotInfo> | null): boolean {
+  if (!player) return true;
+  const rawName = (player.inGameName || player.name || '').trim();
+  if (!rawName) return true;
+  if (rawName.includes('Partner: -') || rawName === 'Partner: - / Solo') return true;
+  return false;
+}
+
+export interface IndexedSlotPlayer {
+  player: PlayerSlotInfo;
+  playerIndex: number;
+}
+
+export function getRealPlayersFromRegistrationWithIndex(
+  reg: Pick<TournamentRegistration, 'players' | 'userId' | 'userName'>
+): IndexedSlotPlayer[] {
+  const result: IndexedSlotPlayer[] = [];
+  if (Array.isArray(reg.players)) {
+    reg.players.forEach((p, idx) => {
+      if (!isPlaceholderSlotPlayer(p)) {
+        result.push({ player: p, playerIndex: idx });
+      }
+    });
+  }
+  if (result.length === 0) {
+    result.push({
+      player: {
+        uid: reg.userId,
+        name: reg.userName || 'Player 1',
+        inGameName: reg.userName || 'Player 1',
+        freeFireUid: '',
+      },
+      playerIndex: 0,
+    });
+  }
+  return result;
+}
+
+export function getSlotWeightForRegistration(
+  tournament?: Pick<Tournament, 'category' | 'gameMode' | 'title' | 'entryFee'> | string | null,
+  players?: Array<Partial<PlayerSlotInfo>> | null
+): number {
+  if (!countsPlayersPerSlotForCategory(tournament)) {
+    return 1;
+  }
+  if (!Array.isArray(players)) return 1;
+  const realCount = players.filter((p) => !isPlaceholderSlotPlayer(p)).length;
+  return Math.max(1, realCount);
+}
+
+export interface ExpandedMatchSlotEntry {
+  slotNumber: number;
+  registration: TournamentRegistration | null;
+  player?: PlayerSlotInfo;
+  playerIndex: number;
+  playerLabel: string;
+}
+
+export function buildExpandedMatchSlots(
+  tournament: Pick<Tournament, 'category' | 'gameMode' | 'title' | 'entryFee'> | null | undefined,
+  registrations: TournamentRegistration[],
+  totalSlots: number
+): ExpandedMatchSlotEntry[] {
+  const usePlayerPerSlot = countsPlayersPerSlotForCategory(tournament);
+  const slotMap = new Map<number, ExpandedMatchSlotEntry>();
+  const overflowEntries: Omit<ExpandedMatchSlotEntry, 'slotNumber'>[] = [];
+
+  if (!usePlayerPerSlot) {
+    const unslottedRegs: TournamentRegistration[] = [];
+    registrations.forEach((reg) => {
+      const sn = Number(reg.slotNumber);
+      if (sn >= 1 && sn <= totalSlots && !slotMap.has(sn)) {
+        slotMap.set(sn, {
+          slotNumber: sn,
+          registration: reg,
+          player: reg.players?.[0],
+          playerIndex: 0,
+          playerLabel: 'Player 1',
+        });
+      } else {
+        unslottedRegs.push(reg);
+      }
+    });
+
+    let nextSlot = 1;
+    unslottedRegs.forEach((reg) => {
+      while (nextSlot <= totalSlots && slotMap.has(nextSlot)) {
+        nextSlot++;
+      }
+      if (nextSlot <= totalSlots) {
+        slotMap.set(nextSlot, {
+          slotNumber: nextSlot,
+          registration: reg,
+          player: reg.players?.[0],
+          playerIndex: 0,
+          playerLabel: 'Player 1',
+        });
+        nextSlot++;
+      }
+    });
+  } else {
+    registrations.forEach((reg) => {
+      const realPlayers = getRealPlayersFromRegistrationWithIndex(reg);
+      const startSlot = Number(reg.slotNumber);
+      const weight = realPlayers.length;
+
+      let canPlaceAtStart = startSlot >= 1 && startSlot + weight - 1 <= totalSlots;
+      if (canPlaceAtStart) {
+        for (let offset = 0; offset < weight; offset++) {
+          if (slotMap.has(startSlot + offset)) {
+            canPlaceAtStart = false;
+            break;
+          }
+        }
+      }
+
+      if (canPlaceAtStart) {
+        realPlayers.forEach(({ player, playerIndex }, offset) => {
+          const sn = startSlot + offset;
+          slotMap.set(sn, {
+            slotNumber: sn,
+            registration: reg,
+            player,
+            playerIndex,
+            playerLabel: `Player ${playerIndex + 1}`,
+          });
+        });
+      } else {
+        realPlayers.forEach(({ player, playerIndex }) => {
+          overflowEntries.push({
+            registration: reg,
+            player,
+            playerIndex,
+            playerLabel: `Player ${playerIndex + 1}`,
+          });
+        });
+      }
+    });
+
+    let nextSlot = 1;
+    overflowEntries.forEach((entry) => {
+      while (nextSlot <= totalSlots && slotMap.has(nextSlot)) {
+        nextSlot++;
+      }
+      if (nextSlot <= totalSlots) {
+        slotMap.set(nextSlot, {
+          slotNumber: nextSlot,
+          ...entry,
+        });
+        nextSlot++;
+      }
+    });
+  }
+
+  return Array.from({ length: totalSlots }, (_, idx) => {
+    const slotNum = idx + 1;
+    return (
+      slotMap.get(slotNum) || {
+        slotNumber: slotNum,
+        registration: null,
+        playerIndex: 0,
+        playerLabel: 'Player 1',
+      }
+    );
+  });
+}
+
 
 

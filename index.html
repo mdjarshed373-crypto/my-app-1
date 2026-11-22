@@ -151,6 +151,38 @@
         } catch (e) {
           window.__TX_IFRAME_EMBEDDED__ = true;
         }
+
+        // Remove any externally injected "Powered by Netlify" badge/drawer so Bottom Navigation stays unobstructed
+        try {
+          var removeNetlifyInjects = function () {
+            var rootEl = document.getElementById('root');
+            var candidates = document.querySelectorAll(
+              '[id*="netlify" i], [class*="netlify" i], iframe[src*="netlify" i], iframe[title*="netlify" i], a[href*="netlify.com"], [data-netlify-deploy-id]'
+            );
+            candidates.forEach(function (el) {
+              if (!rootEl || !rootEl.contains(el)) {
+                el.remove();
+              }
+            });
+            if (document.body) {
+              Array.prototype.slice.call(document.body.children).forEach(function (child) {
+                if (child.id === 'root') return;
+                var txt = (child.textContent || '').toLowerCase();
+                var html = (child.innerHTML || '').toLowerCase();
+                if (txt.indexOf('powered by netlify') !== -1 || html.indexOf('netlify') !== -1) {
+                  child.remove();
+                }
+              });
+            }
+          };
+          removeNetlifyInjects();
+          if (typeof MutationObserver !== 'undefined') {
+            var obs = new MutationObserver(removeNetlifyInjects);
+            obs.observe(document.documentElement, { childList: true, subtree: true });
+          }
+          window.addEventListener('DOMContentLoaded', removeNetlifyInjects);
+          window.addEventListener('load', removeNetlifyInjects);
+        } catch (e) {}
       })();
     </script>
   </head>

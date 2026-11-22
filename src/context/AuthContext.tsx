@@ -400,6 +400,9 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           }
           if (playerSession) {
             setPlayerSession(data);
+            if (typeof window === 'undefined' || localStorage.getItem('tx_user_remember_me') !== 'false') {
+              savePlayerSession(data, true);
+            }
           }
           if (!firebaseUser && biometricSession) {
             setActiveBiometricSession(data);
